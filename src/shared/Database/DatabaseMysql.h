@@ -61,8 +61,6 @@ protected:
     //bind parameters
     void addParam(int nIndex, SqlStmtFieldData const& data);
 
-    static enum_field_types ToMySQLType(SqlStmtFieldData const& data, my_bool& bUnsigned);
-
 private:
     void RemoveBinds();
 
@@ -86,6 +84,12 @@ class MySQLConnection : public SqlConnection
         std::unique_ptr<QueryResult> Query(std::string const& sql) override;
         std::unique_ptr<QueryNamedResult> QueryNamed(std::string const& sql) override;
         bool Execute(std::string const& sql) override;
+        SqlWriteResult ExecuteChecked(std::string const& sql) override;
+        SqlWriteResult ExecutePreparedChecked(
+            std::string const& sql,
+            std::vector<SqlStmtFieldData> const& parameters) override;
+        bool IsConnected() const override { return mMysql != nullptr; }
+        void DiscardConnection() override;
 
         unsigned long escape_string(char* to, char const* from, unsigned long length) override;
 

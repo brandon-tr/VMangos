@@ -25,13 +25,16 @@
 #include "DatabaseEnv.h"
 #include "Config/Config.h"
 #include "Database/SqlOperations.h"
+#include "Database/SqlCheckedBatchExecution.h"
 #include "IO/Multithreading/CreateThread.h"
 #include "Database.h"
 
 #include <ctime>
 #include <iostream>
 #include <fstream>
+#include <limits>
 #include <memory>
+#include <utility>
 
 #define MIN_CONNECTION_POOL_SIZE 1
 #define MAX_CONNECTION_POOL_SIZE 16
@@ -124,7 +127,7 @@ bool SqlConnection::Initialize(std::string const& infoString)
 
 bool SqlConnection::ExecuteStmt(int nIndex, SqlStmtParameters const& id)
 {
-    if(nIndex == -1)
+    if(nIndex == -1 || !IsConnected())
         return false;
 
     //get prepared statement object
@@ -483,6 +486,99 @@ bool Database::DirectPExecute(char const* format,...)
     return DirectExecute(szQuery);
 }
 
+SqlWriteResult Database::DirectExecuteChecked(std::string const& sql)
+{
+    if (!m_pAsyncConn || m_currentTransaction.get() || sql.empty() ||
+        sql.find('\0') != std::string::npos ||
+        sql.size() > std::numeric_limits<unsigned long>::max())
+    {
+        SqlWriteResult result;
+        result.outcome = SqlWriteOutcome::NotExecuted;
+        result.affectedRows = 0;
+        result.nativeError = 0;
+        return result;
+    }
+
+    SqlConnection::Lock guard(m_pAsyncConn);
+    return guard->ExecuteChecked(sql);
+}
+
+bool Database::AsyncExecuteChecked(std::string sql, uint32 serialId,
+                                   SqlWriteCompletion completion)
+{
+    if (!m_pAsyncConn || !m_pResultQueue || m_currentTransaction.get() ||
+        !completion || sql.empty() || sql.find('\0') != std::string::npos ||
+        sql.size() > std::numeric_limits<unsigned long>::max())
+    {
+        return false;
+    }
+
+    SqlCheckedWrite* operation = new SqlCheckedWrite(
+        std::move(sql), serialId, std::move(completion), m_pResultQueue);
+
+    if (!m_bAllowAsyncTransactions)
+    {
+        operation->Execute(m_pAsyncConn);
+        delete operation;
+        return true;
+    }
+
+    AddToSerialDelayQueue(operation);
+    return true;
+}
+
+SqlWriteResult Database::DirectExecutePreparedChecked(
+    std::string const& sql,
+    std::vector<SqlStmtFieldData> const& parameters)
+{
+    SqlWriteResult notExecuted = {SqlWriteOutcome::NotExecuted, 0, 0};
+    if (!m_pAsyncConn || m_currentTransaction.get() ||
+        sql.empty() || sql.find('\0') != std::string::npos)
+        return notExecuted;
+
+    SqlConnection::Lock guard(m_pAsyncConn);
+    SqlWriteResult result = guard->ExecutePreparedChecked(sql, parameters);
+    if (result.outcome == SqlWriteOutcome::OutcomeUnknown)
+        guard->DiscardConnection();
+    return result;
+}
+
+SqlCheckedBatch Database::CreateCheckedBatch(uint32 serialId)
+{
+    return SqlCheckedBatch(this, serialId);
+}
+
+SqlBatchResult Database::DirectExecuteCheckedBatch(SqlCheckedBatch batch)
+{
+    if (!m_pAsyncConn || m_currentTransaction.get() ||
+        batch.GetDatabase() != this || !batch.IsValid())
+        return EmptySqlBatchResult();
+
+    SqlConnection::Lock guard(m_pAsyncConn);
+    return ExecuteSqlCheckedBatch(*guard.operator->(), batch.Writes());
+}
+
+bool Database::AsyncExecuteCheckedBatch(SqlCheckedBatch batch,
+                                        SqlBatchCompletion completion)
+{
+    if (!m_pAsyncConn || !m_pResultQueue || m_currentTransaction.get() ||
+        !completion || batch.GetDatabase() != this || !batch.IsValid())
+        return false;
+
+    SqlCheckedBatchOperation* operation = new SqlCheckedBatchOperation(
+        std::move(batch), std::move(completion), m_pResultQueue);
+
+    if (!m_bAllowAsyncTransactions)
+    {
+        operation->Execute(m_pAsyncConn);
+        delete operation;
+        return true;
+    }
+
+    AddToSerialDelayQueue(operation);
+    return true;
+}
+
 bool Database::BeginTransaction(uint32 serialId)
 {
     if (!m_pAsyncConn)
@@ -537,12 +633,9 @@ bool Database::CommitTransactionDirect()
     if (!m_currentTransaction.get())
         return false;
 
-    // directly execute SqlTransaction
-    SqlTransaction* pTrans = m_currentTransaction.release();
-    pTrans->Execute(m_pAsyncConn);
-    delete pTrans;
-
-    return true;
+    // directly execute SqlTransaction and propagate its actual result
+    std::unique_ptr<SqlTransaction> transaction(m_currentTransaction.release());
+    return transaction->Execute(m_pAsyncConn);
 }
 
 bool Database::RollbackTransaction()

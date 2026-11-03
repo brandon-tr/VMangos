@@ -29,6 +29,7 @@
 #include "AccountMgr.h"
 #include "SharedDefines.h"
 #include "AddonHandler.h"
+#include "PlayerName.h"
 #include "Opcodes.h"
 #include "Crypto/Hash/SHA1.h"
 #include "Database/SqlPreparedStatement.h"
@@ -247,6 +248,24 @@ WorldSocket::HandlerResult WorldSocket::_HandleAuthSession(WorldPacket& recvPack
     recvPacket >> clientSeed;
     recvPacket.read(digest.data(), digest.size());
 
+    uint8 clientRegion = 0;
+    if (recvPacket.rpos() + 6 > recvPacket.size())
+    {
+        packet.Initialize(SMSG_AUTH_RESPONSE, 1);
+        packet << uint8(AUTH_VERSION_MISMATCH);
+        SendPacket(packet);
+        return HandlerResult::Fail;
+    }
+    uint8 nameProfileHeader[6];
+    recvPacket.read(nameProfileHeader, sizeof(nameProfileHeader));
+    if (!decodePlayerNameHandshake(nameProfileHeader, sizeof(nameProfileHeader), clientRegion))
+    {
+        packet.Initialize(SMSG_AUTH_RESPONSE, 1);
+        packet << uint8(AUTH_VERSION_MISMATCH);
+        SendPacket(packet);
+        return HandlerResult::Fail;
+    }
+
     sLog.Out(LOG_BASIC, LOG_LVL_DEBUG, "WorldSocket::HandleAuthSession: client %u, serverId %u, account %s, clientseed %u",
               clientBuild,
               serverId,
@@ -425,7 +444,7 @@ WorldSocket::HandlerResult WorldSocket::_HandleAuthSession(WorldPacket& recvPack
         this->m_sessionNoAuthTimeout = nullptr;
     }
 
-    m_Session = new WorldSession(accountId, this->shared_from_this(), security, mutetime, locale);
+    m_Session = new WorldSession(accountId, this->shared_from_this(), security, mutetime, locale, clientRegion);
 
     m_Crypt.SetKey(K.AsByteArray());
     m_Crypt.Init();

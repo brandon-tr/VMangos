@@ -23,6 +23,10 @@
 #define _AUCTION_HOUSE_MGR_H
 
 #include <vector>
+
+enum class MailPersistenceStatus;
+class CharacterPersistenceContext;
+class Player;
 #include <memory>
 
 #include "Common.h"
@@ -34,6 +38,7 @@ class Item;
 class Player;
 class Unit;
 class WorldPacket;
+class CharacterPersistenceContext;
 
 #define MIN_AUCTION_TIME (2*HOUR)
 
@@ -68,6 +73,7 @@ struct AuctionEntry
 {
     uint32 Id;
     uint32 itemGuidLow;
+    bool recoveryBlocked = false;   // uncertain outcome: never retry automatically
     uint32 itemTemplate;
     uint32 owner;
     uint32 ownerAccount;
@@ -89,6 +95,8 @@ struct AuctionEntry
     bool BuildAuctionInfo(WorldPacket& data) const;
     void DeleteFromDB() const;
     void SaveToDB() const;
+    bool AppendDeleteFromDB(CharacterPersistenceContext& context) const;
+    bool AppendSaveToDB(CharacterPersistenceContext& context) const;
     bool IsAvailableFor(Player* player);
 };
 
@@ -169,9 +177,34 @@ class AuctionHouseMgr
         }
 
         //auction messages
-        void SendAuctionWonMail(AuctionEntry* auction);
-        void SendAuctionSuccessfulMail(AuctionEntry* auction);
-        void SendAuctionExpiredMail(AuctionEntry* auction);
+        bool AppendAuctionWonMail(CharacterPersistenceContext& context,
+                                  AuctionEntry* auction, uint32 bidderGuid,
+                                  uint32 bidAmount);
+        bool AppendAuctionSuccessfulMail(CharacterPersistenceContext& context,
+                                         AuctionEntry* auction, uint32 bidderGuid,
+                                         uint32 bidAmount);
+        bool AppendAuctionExpiredMail(CharacterPersistenceContext& context,
+                                      AuctionEntry* auction);
+        bool AppendAuctionOutbiddedMail(CharacterPersistenceContext& context,
+                                        AuctionEntry* auction, uint32 oldBidderGuid,
+                                        uint32 oldBid);
+        bool AppendAuctionCancelledToBidderMail(
+            CharacterPersistenceContext& context, AuctionEntry* auction,
+            uint32 bidderGuid, uint32 bidAmount);
+        bool AppendAuctionCancelledOwnerMail(CharacterPersistenceContext& context,
+                                             AuctionEntry* auction);
+
+        // Composed business operations: mail/Item/money/auction row are one unit.
+        MailPersistenceStatus ProcessExpiredAuction(AuctionEntry* auction);
+        MailPersistenceStatus ProcessBuyoutAuction(AuctionEntry* auction,
+                                                   Player* buyer, int32 paid,
+                                                   uint32 previousBidder,
+                                                   uint32 previousBid);
+        MailPersistenceStatus ProcessCancelAuction(AuctionEntry* auction,
+                                                   Player* owner,
+                                                   uint32 auctionCut);
+        MailPersistenceStatus ProcessOrphanedAuction(AuctionEntry* auction);
+
         static uint32 GetAuctionDeposit(AuctionHouseEntry const* entry, uint32 time, Item* pItem);
 
         static uint32 GetAuctionHouseId(uint32 factionTemplateId);

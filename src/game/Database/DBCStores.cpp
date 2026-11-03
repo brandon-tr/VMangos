@@ -25,8 +25,11 @@
 #include "DBCfmt.h"
 #include "SpellMgr.h"
 #include "ObjectMgr.h"
+#include "PlayerNameLists.h"
 
 #include <map>
+#include <memory>
+#include <stdexcept>
 #include <vector>
 #include <regex>
 
@@ -73,7 +76,9 @@ DBCStorage <ItemRandomPropertiesEntry> sItemRandomPropertiesStore(ItemRandomProp
 DBCStorage <ItemSetEntry> sItemSetStore(ItemSetEntryfmt);
 DBCStorage <LockEntry> sLockStore(LockEntryfmt);
 DBCStorage<NamesProfanityEntry> sNamesProfanityStore(NamesProfanityEntryfmt);
+static DBCStorage<ChatProfanityEntry> sChatProfanityStore(ChatProfanityEntryfmt);
 DBCStorage<NamesReservedEntry> sNamesReservedStore(NamesReservedEntryfmt);
+static std::unique_ptr<DbcPlayerNameLists> sPlayerNameLists;
 static std::wstring const emacsStartOfLineToken = L"\\<"; // equivalent to ^
 static std::wstring const emacsEndOfLineToken = L"\\>";   // equivalent to $
 typedef std::vector<std::wregex> NameValidationRegexContainer;
@@ -182,11 +187,32 @@ inline void LoadDBC(uint32& availableDbcLocales, BarGoLink& bar, StoreProblemLis
     }
 }
 
+template<class Entry>
+std::vector<PlayerNamePatternRow> CollectPlayerNamePatterns(
+    DBCStorage<Entry>& store, char const* filename)
+{
+    std::vector<PlayerNamePatternRow> rows;
+    rows.reserve(store.GetNumRows());
+    for (uint32 i = 0; i < store.GetNumRows(); ++i)
+    {
+        Entry const* entry = store.LookupEntry(i);
+        if (!entry)
+            continue;
+        if (!entry->Name)
+        {
+            throw std::invalid_argument(std::string(filename) + " row " +
+                                        std::to_string(i) + ": null pattern");
+        }
+        rows.push_back(PlayerNamePatternRow{i, entry->Name});
+    }
+    return rows;
+}
+
 void LoadDBCStores(std::string const& dataPath)
 {
     std::string dbcPath = dataPath + "dbc/";
 
-    uint32 const DBCFilesCount = 45;
+    uint32 const DBCFilesCount = 46;
 
     BarGoLink bar(DBCFilesCount);
 
@@ -234,47 +260,8 @@ void LoadDBCStores(std::string const& dataPath)
     LoadDBC(availableDbcLocales, bar, badDbcFiles, sLockStore,                dbcPath, "Lock.dbc");
 
     LoadDBC(availableDbcLocales, bar, badDbcFiles, sNamesProfanityStore,      dbcPath, "NamesProfanity.dbc");
+    LoadDBC(availableDbcLocales, bar, badDbcFiles, sChatProfanityStore,       dbcPath, "ChatProfanity.dbc");
     LoadDBC(availableDbcLocales, bar, badDbcFiles, sNamesReservedStore,       dbcPath, "NamesReserved.dbc");
-    for (uint32 i = 0; i < sNamesProfanityStore.GetNumRows(); ++i)
-    {
-        NamesProfanityEntry const* namesProfanity = sNamesProfanityStore.LookupEntry(i);
-        if (!namesProfanity)
-            continue;
-
-        std::wstring wname;
-        ASSERT(Utf8toWStr(namesProfanity->Name, wname));
-
-        // the dbc uses emacs regex syntax
-        auto index = wname.find(emacsStartOfLineToken, 0);
-        if (index != std::wstring::npos)
-            wname.replace(index, emacsStartOfLineToken.length(), L"^");
-
-        index = wname.find(emacsEndOfLineToken, 0);
-        if (index != std::wstring::npos)
-            wname.replace(index, emacsEndOfLineToken.length(), L"$");
-
-        NamesProfaneValidators.emplace_back(wname, std::regex::icase | std::regex::optimize);
-    }
-    for (uint32 i = 0; i < sNamesReservedStore.GetNumRows(); ++i)
-    {
-        NamesReservedEntry const* namesReserved = sNamesReservedStore.LookupEntry(i);
-        if (!namesReserved)
-            continue;
-
-        std::wstring wname;
-        ASSERT(Utf8toWStr(namesReserved->Name, wname));
-
-        // the dbc uses emacs regex syntax
-        auto index = wname.find(emacsStartOfLineToken, 0);
-        if (index != std::wstring::npos)
-            wname.replace(index, emacsStartOfLineToken.length(), L"^");
-
-        index = wname.find(emacsEndOfLineToken, 0);
-        if (index != std::wstring::npos)
-            wname.replace(index, emacsEndOfLineToken.length(), L"$");
-
-        NamesReservedValidators.emplace_back(wname, std::regex::icase | std::regex::optimize);
-    }
 
     LoadDBC(availableDbcLocales, bar, badDbcFiles, sQuestSortStore,           dbcPath, "QuestSort.dbc");
     LoadDBC(availableDbcLocales, bar, badDbcFiles, sSkillLineStore,           dbcPath, "SkillLine.dbc");
@@ -440,8 +427,81 @@ void LoadDBCStores(std::string const& dataPath)
         exit(1);
     }
 
+    try
+    {
+        std::vector<PlayerNamePatternRow> namesProfanity =
+            CollectPlayerNamePatterns(sNamesProfanityStore, "NamesProfanity.dbc");
+        std::vector<PlayerNamePatternRow> chatProfanity =
+            CollectPlayerNamePatterns(sChatProfanityStore, "ChatProfanity.dbc");
+        std::vector<PlayerNamePatternRow> namesReserved =
+            CollectPlayerNamePatterns(sNamesReservedStore, "NamesReserved.dbc");
+
+        std::unique_ptr<DbcPlayerNameLists> lists(
+            new DbcPlayerNameLists(namesProfanity, chatProfanity, namesReserved));
+        sPlayerNameLists = std::move(lists);
+
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL,
+                 ">> Loaded name restriction lists: NamesProfanity %u, ChatProfanity %u, NamesReserved %u",
+                 uint32(namesProfanity.size()), uint32(chatProfanity.size()),
+                 uint32(namesReserved.size()));
+    }
+    catch (std::invalid_argument const& e)
+    {
+        sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "\nPlayerNameLists: %s", e.what());
+        Log::WaitBeforeContinueIfNeed();
+        exit(1);
+    }
+
+    for (uint32 i = 0; i < sNamesProfanityStore.GetNumRows(); ++i)
+    {
+        NamesProfanityEntry const* namesProfanity = sNamesProfanityStore.LookupEntry(i);
+        if (!namesProfanity)
+            continue;
+
+        std::wstring wname;
+        ASSERT(Utf8toWStr(namesProfanity->Name, wname));
+
+        // the dbc uses emacs regex syntax
+        auto index = wname.find(emacsStartOfLineToken, 0);
+        if (index != std::wstring::npos)
+            wname.replace(index, emacsStartOfLineToken.length(), L"^");
+
+        index = wname.find(emacsEndOfLineToken, 0);
+        if (index != std::wstring::npos)
+            wname.replace(index, emacsEndOfLineToken.length(), L"$");
+
+        NamesProfaneValidators.emplace_back(wname, std::regex::icase | std::regex::optimize);
+    }
+    for (uint32 i = 0; i < sNamesReservedStore.GetNumRows(); ++i)
+    {
+        NamesReservedEntry const* namesReserved = sNamesReservedStore.LookupEntry(i);
+        if (!namesReserved)
+            continue;
+
+        std::wstring wname;
+        ASSERT(Utf8toWStr(namesReserved->Name, wname));
+
+        // the dbc uses emacs regex syntax
+        auto index = wname.find(emacsStartOfLineToken, 0);
+        if (index != std::wstring::npos)
+            wname.replace(index, emacsStartOfLineToken.length(), L"^");
+
+        index = wname.find(emacsEndOfLineToken, 0);
+        if (index != std::wstring::npos)
+            wname.replace(index, emacsEndOfLineToken.length(), L"$");
+
+        NamesReservedValidators.emplace_back(wname, std::regex::icase | std::regex::optimize);
+    }
+
     sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "");
     sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, ">> Initialized %d data stores", DBCFilesCount);
+}
+
+PlayerNameLists const& GetPlayerNameLists()
+{
+    if (!sPlayerNameLists)
+        throw std::logic_error("PlayerNameLists not initialized");
+    return *sPlayerNameLists;
 }
 
 char const* GetPetName(uint32 petfamily, uint32 dbclang)

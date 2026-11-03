@@ -20,12 +20,15 @@
 #define SQLPREPAREDSTATEMENTS_H
 
 #include "Common.h"
+#include "Database/SqlWrite.h"
 #include <vector>
 #include <stdexcept>
 
 class Database;
 class SqlConnection;
 class QueryResult;
+class SqlCheckedBatch;
+enum class SqlAffectedRowsPolicy;
 
 union SqlStmtField
 {
@@ -206,6 +209,10 @@ class SqlStatement
 
         bool Execute();
         bool DirectExecute();
+        SqlWriteResult DirectExecuteChecked();
+        bool AppendToCheckedBatch(SqlCheckedBatch& batch,
+                                  SqlAffectedRowsPolicy policy);
+        bool AppendToCheckedBatch(SqlCheckedBatch& batch);
 
         //templates to simplify 1-4 parameter bindings
         template<typename ParamType1>

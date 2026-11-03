@@ -31,6 +31,7 @@
 #include "World.h"
 #include "GuildMgr.h"
 #include "ObjectMgr.h"
+#include "PlayerName.h"
 #include "WorldSession.h"
 #include "ScriptMgr.h"
 #include "Compression/ZLib.h"
@@ -465,13 +466,13 @@ void WorldSession::HandleAddFriendOpcode(WorldPackets::Misc::AddFriend const& pa
 {
     ASSERT(GetMasterPlayer());
 
-    if (!normalizePlayerName(const_cast<std::string&>(packet.friendName)))
+    if (!normalizeFullPlayerNameForLookup(const_cast<std::string&>(packet.friendName)))
         return;
 
     sLog.Out(LOG_BASIC, LOG_LVL_DEBUG, "WORLD: %s asked to add friend : '%s'",
               GetMasterPlayer()->GetName(), packet.friendName.c_str());
 
-    PlayerCacheData const* pData = sObjectMgr.GetPlayerDataByName(packet.friendName);
+    PlayerCacheSnapshot pData = sObjectMgr.GetPlayerDataByName(packet.friendName);
     if (!pData)
         return;
 
@@ -521,13 +522,13 @@ void WorldSession::HandleAddIgnoreOpcode(WorldPackets::Misc::AddIgnore const& pa
 {
     ASSERT(GetMasterPlayer());
 
-    if (!normalizePlayerName(const_cast<std::string&>(packet.ignoreName)))
+    if (!normalizeFullPlayerNameForLookup(const_cast<std::string&>(packet.ignoreName)))
         return;
 
     sLog.Out(LOG_BASIC, LOG_LVL_DEBUG, "WORLD: %s asked to Ignore: '%s'",
               GetMasterPlayer()->GetName(), packet.ignoreName.c_str());
 
-    PlayerCacheData const* pData = sObjectMgr.GetPlayerDataByName(packet.ignoreName);
+    PlayerCacheSnapshot pData = sObjectMgr.GetPlayerDataByName(packet.ignoreName);
     if (!pData)
         return;
 
@@ -1037,10 +1038,11 @@ void WorldSession::HandleInspectHonorStatsOpcode(WorldPackets::Misc::InspectHono
 
 void WorldSession::HandleTeleportToUnitOpcode(WorldPackets::Misc::TeleportToUnit const& packet)
 {
-    if (packet.playerName.length() > MAX_PLAYER_NAME)
+    std::string playerName = packet.playerName;
+    if (!normalizeFullPlayerNameForLookup(playerName))
         return;
 
-    std::string command = ".goname " + packet.playerName;
+    std::string command = ".goname \"" + playerName + "\"";
     SanitizeChatMessageAndProcessCommand(command, LANG_UNIVERSAL, CHAT_MSG_SYSTEM);
 }
 
@@ -1094,7 +1096,7 @@ void WorldSession::HandleWhoisOpcode(WorldPackets::Query::Whois const& packet)
         return;
     }
 
-    if (packet.charName.empty() || !normalizePlayerName(const_cast<std::string&>(packet.charName)))
+    if (packet.charName.empty() || !normalizeFullPlayerNameForLookup(const_cast<std::string&>(packet.charName)))
     {
         SendNotification(LANG_NEED_CHARACTER_NAME);
         return;

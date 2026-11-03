@@ -21,6 +21,7 @@
 
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
+#include "PlayerName.h"
 #include "Policies/SingletonImp.h"
 #include "Player.h"
 #include "Corpse.h"
@@ -92,8 +93,11 @@ Player* ObjectAccessor::FindPlayer(ObjectGuid guid)
 
 Player* ObjectAccessor::FindPlayerByNameNotInWorld(char const* name)
 {
+    if (!name)
+        return nullptr;
+
     std::string cppname(name);
-    if (!normalizePlayerName(cppname))
+    if (!normalizeFullPlayerNameForLookup(cppname))
         return nullptr;
 
     NameToPlayerPtr::iterator it = playerNameToPlayerPointer.find(cppname);
@@ -113,8 +117,11 @@ Player* ObjectAccessor::FindPlayerByName(char const* name)
 
 MasterPlayer* ObjectAccessor::FindMasterPlayer(char const* name)
 {
+    if (!name)
+        return nullptr;
+
     std::string cppname(name);
-    if (!normalizePlayerName(cppname))
+    if (!normalizeFullPlayerNameForLookup(cppname))
         return nullptr;
 
     NameToMasterPlayerPtr::iterator it = playerNameToMasterPlayerPointer.find(cppname);
@@ -244,13 +251,20 @@ void ObjectAccessor::AddCorpsesToGrid(GridPair const& gridpair, GridType& grid, 
     }
 }
 
-void ObjectAccessor::ConvertCorpseForPlayer(ObjectGuid player_guid, Player const* looter)
+void ObjectAccessor::ConvertCorpseForPlayer(ObjectGuid player_guid, Player const* looter,
+                                            bool deleteCorpseRow)
 {
     ASSERT(player_guid.IsPlayer());
 
     Corpse* corpse = GetCorpseForPlayerGUID(player_guid);
     if (!corpse)
         return;
+
+    // The composed character-deletion unit already staged the corpse row
+    // deletion; the later local removal (direct or via the map queue) must not
+    // submit a second write for it.
+    if (!deleteCorpseRow)
+        corpse->MarkDeletedFromDB();
 
     // remove corpse from player_guid -> corpse map
     RemoveCorpse(corpse);

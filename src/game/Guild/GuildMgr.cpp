@@ -21,6 +21,9 @@
 #include "Log.h"
 #include "ObjectGuid.h"
 #include "Database/DatabaseEnv.h"
+#include "Database/CharacterPersistenceContext.h"
+#include "Database/CharacterDeletionRelationships.h"
+#include "Database/SqlPreparedStatement.h"
 #include "Policies/SingletonImp.h"
 #include "ProgressBar.h"
 #include "World.h"
@@ -320,6 +323,70 @@ void GuildMgr::DeletePetitionSignaturesByPlayer(ObjectGuid guid, uint32 exceptPe
         Petition* petition = iter.second;
         petition->DeleteSignatureByPlayer(guid);
     }
+}
+
+bool GuildMgr::AppendDeletionPetitionCleanup(
+    CharacterPersistenceContext& context, ObjectGuid guid,
+    PetitionDeletionPlan& plan)
+{
+    Database* database = context.Batch().GetDatabase();
+    if (!database || guid.IsEmpty())
+    {
+        context.Invalidate();
+        return false;
+    }
+
+    static SqlStatementID deleteOwned;
+    SqlStatement owned = database->CreateStatement(
+        deleteOwned, "DELETE FROM `petition` WHERE `owner_guid` = ?");
+    owned.addUInt32(guid.GetCounter());
+    if (!owned.AppendToCheckedBatch(
+            context.Batch(), SqlAffectedRowsPolicy::Any))
+    {
+        context.Invalidate();
+        return false;
+    }
+
+    static SqlStatementID deleteSigns;
+    SqlStatement signs = database->CreateStatement(
+        deleteSigns,
+        "DELETE FROM `petition_sign` WHERE `owner_guid` = ? OR `player_guid` = ?");
+    signs.addUInt32(guid.GetCounter());
+    signs.addUInt32(guid.GetCounter());
+    if (!signs.AppendToCheckedBatch(
+            context.Batch(), SqlAffectedRowsPolicy::Any))
+    {
+        context.Invalidate();
+        return false;
+    }
+
+    std::lock_guard<std::shared_timed_mutex> guard(m_petitionsMutex);
+    for (auto const& iter : m_petitionMap)
+    {
+        Petition* petition = iter.second;
+        if (!petition)
+            continue;
+        if (petition->GetOwnerGuid() == guid)
+            plan.ownedPetitions.push_back(petition);
+        if (petition->GetSignatureForPlayerGuid(guid))
+            plan.changedPetitions.push_back(petition);
+    }
+    plan.signatureGuids.push_back(guid);
+    return true;
+}
+
+void GuildMgr::ApplyDeletionPetitionCleanup(PetitionDeletionPlan const& plan)
+{
+    std::lock_guard<std::shared_timed_mutex> guard(m_petitionsMutex);
+    for (Petition* petition : plan.changedPetitions)
+    {
+        if (!petition)
+            continue;
+        for (ObjectGuid const& guid : plan.signatureGuids)
+            petition->DeleteSignatureByPlayer(guid);
+    }
+    // Owned petition rows are removed by the checked batch.  As before, the
+    // in-memory Petition objects are left for the normal petition cleanup pass.
 }
 
 bool Petition::LoadFromDB(const std::unique_ptr<QueryResult>& result)

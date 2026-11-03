@@ -20,6 +20,9 @@
  */
 
 #include "Database/DatabaseEnv.h"
+#include "Database/CharacterPersistenceContext.h"
+#include "Database/CharacterDeletionRelationships.h"
+#include "Database/SqlPreparedStatement.h"
 #include "WorldPacket.h"
 #include "WorldSession.h"
 #include "Player.h"
@@ -229,7 +232,7 @@ GuildAddStatus Guild::AddMember(ObjectGuid plGuid, uint32 plRank, uint32 petitio
     }
     else
     {
-        PlayerCacheData const* data = sObjectMgr.GetPlayerDataByGUID(lowguid);
+        PlayerCacheSnapshot data = sObjectMgr.GetPlayerDataByGUID(lowguid);
         if (!data)
             return GuildAddStatus::UNKNOWN_PLAYER;
         if (data->sName.empty())
@@ -590,6 +593,191 @@ bool Guild::DelMember(ObjectGuid guid, bool isDisbanding)
         UpdateAccountsNumber();
 
     return members.empty();
+}
+
+bool Guild::AppendDeletionMemberRemoval(
+    CharacterPersistenceContext& context, ObjectGuid guid,
+    GuildDeletionMemberPlan& plan)
+{
+    uint32 const lowguid = guid.GetCounter();
+    Database* database = context.Batch().GetDatabase();
+    if (!database || lowguid == 0 ||
+        members.find(lowguid) == members.end())
+    {
+        context.Invalidate();
+        return false;
+    }
+
+    plan.guild = this;
+    plan.guildId = m_Id;
+    plan.memberGuid = lowguid;
+
+    MemberSlot const* oldLeader = nullptr;
+    MemberSlot const* best = nullptr;
+    uint32 newLeaderGuid = 0;
+    if (m_LeaderGuid == guid)
+    {
+        for (auto const& member : members)
+        {
+            if (member.first == lowguid)
+            {
+                oldLeader = &member.second;
+                continue;
+            }
+            if (!best || best->RankId > member.second.RankId)
+            {
+                best = &member.second;
+                newLeaderGuid = member.first;
+            }
+        }
+    }
+
+    bool const becomesEmpty = members.size() == 1 || (m_LeaderGuid == guid && !best);
+    if (becomesEmpty)
+    {
+        // Mirror Guild::Disband: every member row plus the guild tables.
+        plan.becomesEmpty = true;
+        static SqlStatementID deleteMembers;
+        static SqlStatementID deleteGuild;
+        static SqlStatementID deleteRanks;
+        static SqlStatementID deleteEvents;
+
+        SqlStatement membersStmt = database->CreateStatement(
+            deleteMembers, "DELETE FROM `guild_member` WHERE `guild_id` = ?");
+        membersStmt.addUInt32(m_Id);
+        if (!membersStmt.AppendToCheckedBatch(
+                context.Batch(), SqlAffectedRowsPolicy::Any))
+        {
+            context.Invalidate();
+            return false;
+        }
+
+        SqlStatement guildStmt = database->CreateStatement(
+            deleteGuild, "DELETE FROM `guild` WHERE `guild_id` = ?");
+        guildStmt.addUInt32(m_Id);
+        if (!guildStmt.AppendToCheckedBatch(
+                context.Batch(), SqlAffectedRowsPolicy::ExactlyOne))
+        {
+            context.Invalidate();
+            return false;
+        }
+
+        SqlStatement rankStmt = database->CreateStatement(
+            deleteRanks, "DELETE FROM `guild_rank` WHERE `guild_id` = ?");
+        rankStmt.addUInt32(m_Id);
+        if (!rankStmt.AppendToCheckedBatch(
+                context.Batch(), SqlAffectedRowsPolicy::Any))
+        {
+            context.Invalidate();
+            return false;
+        }
+
+        SqlStatement eventStmt = database->CreateStatement(
+            deleteEvents, "DELETE FROM `guild_eventlog` WHERE `guild_id` = ?");
+        eventStmt.addUInt32(m_Id);
+        if (!eventStmt.AppendToCheckedBatch(
+                context.Batch(), SqlAffectedRowsPolicy::Any))
+        {
+            context.Invalidate();
+            return false;
+        }
+        return true;
+    }
+
+    if (m_LeaderGuid == guid)
+    {
+        plan.leaderRemoved = true;
+        plan.newLeaderGuid = newLeaderGuid;
+        plan.newLeaderName = best->Name;
+        if (oldLeader)
+            plan.oldLeaderName = oldLeader->Name;
+
+        static SqlStatementID updateLeader;
+        SqlStatement leader = database->CreateStatement(
+            updateLeader,
+            "UPDATE `guild` SET `leader_guid` = ? WHERE `guild_id` = ? AND `leader_guid` = ?");
+        leader.addUInt32(newLeaderGuid);
+        leader.addUInt32(m_Id);
+        leader.addUInt32(lowguid);
+        if (!leader.AppendToCheckedBatch(
+                context.Batch(), SqlAffectedRowsPolicy::ExactlyOne))
+        {
+            context.Invalidate();
+            return false;
+        }
+
+        // The successor's persisted rank must be part of the deletion unit.
+        // MemberSlot::ChangeRank stays SQL-writing for its other callers; the
+        // completion path below only publishes the rank locally.
+        static SqlStatementID updateSuccessorRank;
+        SqlStatement rank = database->CreateStatement(
+            updateSuccessorRank,
+            "UPDATE `guild_member` SET `rank` = ? WHERE `guid` = ? AND `guild_id` = ? AND `rank` = ?");
+        rank.addUInt32(GR_GUILDMASTER);
+        rank.addUInt32(newLeaderGuid);
+        rank.addUInt32(m_Id);
+        rank.addUInt32(best->RankId);
+        if (!rank.AppendToCheckedBatch(
+                context.Batch(), SqlAffectedRowsPolicy::ExactlyOne))
+        {
+            context.Invalidate();
+            return false;
+        }
+    }
+
+    static SqlStatementID deleteMember;
+    SqlStatement member = database->CreateStatement(
+        deleteMember,
+        "DELETE FROM `guild_member` WHERE `guid` = ? AND `guild_id` = ?");
+    member.addUInt32(lowguid);
+    member.addUInt32(m_Id);
+    if (!member.AppendToCheckedBatch(
+            context.Batch(), SqlAffectedRowsPolicy::ExactlyOne))
+    {
+        context.Invalidate();
+        return false;
+    }
+    return true;
+}
+
+void Guild::ApplyDeletionMemberRemoval(GuildDeletionMemberPlan const& plan)
+{
+    if (plan.becomesEmpty)
+    {
+        BroadcastEvent(GE_DISBANDED);
+        members.clear();
+        sGuildMgr.RemoveGuild(m_Id);
+        return;
+    }
+
+    members.erase(plan.memberGuid);
+    sGuildMgr.GuildMemberRemoved(ObjectGuid(HIGHGUID_PLAYER, plan.memberGuid));
+
+    if (Player* player = sObjectMgr.GetPlayer(
+            ObjectGuid(HIGHGUID_PLAYER, plan.memberGuid)))
+    {
+        player->SetInGuild(0);
+        player->SetRank(0);
+    }
+
+    if (plan.leaderRemoved)
+    {
+        m_LeaderGuid = ObjectGuid(HIGHGUID_PLAYER, plan.newLeaderGuid);
+        if (MemberSlot* slot = GetMemberSlot(m_LeaderGuid))
+            slot->RankId = GR_GUILDMASTER;      // persisted in the checked batch
+        if (Player* newLeader = sObjectMgr.GetPlayer(m_LeaderGuid))
+            newLeader->SetRank(GR_GUILDMASTER);
+        if (!plan.oldLeaderName.empty())
+        {
+            BroadcastEvent(GE_LEADER_CHANGED, plan.oldLeaderName.c_str(),
+                           plan.newLeaderName.c_str());
+            BroadcastEvent(GE_LEFT,
+                           ObjectGuid(HIGHGUID_PLAYER, plan.memberGuid),
+                           plan.oldLeaderName.c_str());
+        }
+    }
+
+    UpdateAccountsNumber();
 }
 
 void Guild::BroadcastToGuild(WorldSession const* senderSession, char const* msg, uint32 language)

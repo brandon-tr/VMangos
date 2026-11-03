@@ -27,6 +27,7 @@
 #include "WorldSession.h"
 #include "World.h"
 #include "ObjectMgr.h"
+#include "PlayerName.h"
 #include "Player.h"
 #include "Group.h"
 #include "Utilities/Random.h"
@@ -58,7 +59,7 @@ void WorldSession::HandleGroupInviteOpcode(WorldPackets::Group::GroupInvite cons
     // Attempt add selected player
 
     // Cheating
-    if (!normalizePlayerName(const_cast<std::string&>(packet.memberName)))
+    if (!normalizeFullPlayerNameForLookup(const_cast<std::string&>(packet.memberName)))
     {
         SendPartyResult(PARTY_OP_INVITE, packet.memberName, ERR_BAD_PLAYER_NAME_S);
         return;
@@ -254,7 +255,7 @@ void WorldSession::HandleGroupUninviteGuidOpcode(WorldPackets::Group::GroupUninv
 void WorldSession::HandleGroupUninviteOpcode(WorldPackets::Group::GroupUninvite const& packet)
 {
     // player not found
-    if (!normalizePlayerName(const_cast<std::string&>(packet.memberName)))
+    if (!normalizeFullPlayerNameForLookup(const_cast<std::string&>(packet.memberName)))
         return;
 
     // can't uninvite yourself

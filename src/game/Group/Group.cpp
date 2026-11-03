@@ -22,6 +22,9 @@
 #include "Common.h"
 #include "Opcodes.h"
 #include "WorldPacket.h"
+#include "Database/CharacterPersistenceContext.h"
+#include "Database/CharacterDeletionRelationships.h"
+#include "Database/SqlPreparedStatement.h"
 #include "WorldSession.h"
 #include "Player.h"
 #include "World.h"
@@ -200,7 +203,7 @@ bool Group::LoadGroupFromDB(Field* fields)
 bool Group::LoadMemberFromDB(uint32 guidLow, uint8 subgroup, bool assistant)
 {
     // skip nonexistent member
-    PlayerCacheData const* data = sObjectMgr.GetPlayerDataByGUID(guidLow);
+    PlayerCacheSnapshot data = sObjectMgr.GetPlayerDataByGUID(guidLow);
     if (!data)
         return false;
 
@@ -1772,6 +1775,490 @@ void Group::_setLeader(ObjectGuid guid)
     m_leaderName = slot->name;
     m_leaderLastOnline = time(nullptr);
     _updateLeaderFlag();
+}
+
+bool Group::AppendDeletionMemberRemoval(
+    CharacterPersistenceContext& context, ObjectGuid guid,
+    GroupDeletionMemberPlan& plan)
+{
+    uint32 const lowguid = guid.GetCounter();
+    Database* database = context.Batch().GetDatabase();
+    if (!database || lowguid == 0 ||
+        _getMemberCSlot(guid) == m_memberSlots.end())
+    {
+        context.Invalidate();
+        return false;
+    }
+
+    plan.group = this;
+    plan.groupId = m_Id;
+    plan.memberGuid = lowguid;
+    plan.isRaid = isRaidGroup();
+    plan.isBg = isBGGroup();
+    plan.inLfg = IsInLFG();
+    plan.lfgAreaId = m_LFGAreaId;
+
+    auto appendDelete = [&](SqlStatementID& id, char const* sql
+                            , uint32 first, uint32 second, bool two,
+                            SqlAffectedRowsPolicy policy) {
+        SqlStatement statement = database->CreateStatement(id, sql);
+        statement.addUInt32(first);
+        if (two)
+            statement.addUInt32(second);
+        if (!statement.AppendToCheckedBatch(context.Batch(), policy))
+        {
+            context.Invalidate();
+            return false;
+        }
+        return true;
+    };
+
+    if (GetMembersCount() <= GetMembersMinCount())
+    {
+        plan.kind = GroupDeletionMemberPlan::Kind::Disband;
+        static SqlStatementID deleteGroup;
+        static SqlStatementID deleteMembers;
+        if (!appendDelete(deleteGroup, "DELETE FROM `groups` WHERE `group_id` = ?",
+                          m_Id, 0, false, SqlAffectedRowsPolicy::ExactlyOne) ||
+            !appendDelete(deleteMembers,
+                          "DELETE FROM `group_member` WHERE `group_id` = ?",
+                          m_Id, 0, false, SqlAffectedRowsPolicy::Any))
+            return false;
+
+        if (!isBGGroup())
+        {
+            // Legacy Disband hands the group instance save to the last online
+            // member that is not the removed initiator, before the remaining
+            // binds are reset.  Stage that transfer before any local change.
+            Player* remainingPlayer = nullptr;
+            for (auto const& member : m_memberSlots)
+            {
+                Player* player = sObjectMgr.GetPlayer(member.guid);
+                if (!player || member.guid == guid)
+                    continue;
+                remainingPlayer = player;
+            }
+
+            if (remainingPlayer)
+            {
+                uint32 const mapId = remainingPlayer->GetMapId();
+                auto const bindItr = m_boundInstances.find(mapId);
+                if (bindItr != m_boundInstances.end() &&
+                    !bindItr->second.perm &&
+                    !remainingPlayer->GetBoundInstance(mapId))
+                {
+                    DungeonPersistentState* state = bindItr->second.state;
+                    plan.hasTransferBind = true;
+                    plan.transferPlayerGuid = remainingPlayer->GetGUIDLow();
+                    plan.transferBind = GroupDeletionMemberPlan::BindOp{
+                        mapId, state->GetInstanceId(), bindItr->second.perm,
+                        state};
+
+                    static SqlStatementID insertPlayerBind;
+                    SqlStatement insert = database->CreateStatement(
+                        insertPlayerBind,
+                        "INSERT INTO `character_instance` (`guid`, `instance`, `permanent`) VALUES (?, ?, ?)");
+                    insert.addUInt32(remainingPlayer->GetGUIDLow());
+                    insert.addUInt32(state->GetInstanceId());
+                    insert.addUInt32(0);
+                    if (!insert.AppendToCheckedBatch(
+                            context.Batch(), SqlAffectedRowsPolicy::ExactlyOne))
+                    {
+                        context.Invalidate();
+                        return false;
+                    }
+
+                    static SqlStatementID deleteTransferredGroupBind;
+                    SqlStatement removeBind = database->CreateStatement(
+                        deleteTransferredGroupBind,
+                        "DELETE FROM `group_instance` WHERE `leader_guid` = ? AND `instance` = ?");
+                    removeBind.addUInt32(m_leaderGuid.GetCounter());
+                    removeBind.addUInt32(state->GetInstanceId());
+                    if (!removeBind.AppendToCheckedBatch(
+                            context.Batch(), SqlAffectedRowsPolicy::Any))
+                    {
+                        context.Invalidate();
+                        return false;
+                    }
+                }
+            }
+        }
+
+        if (!isBGGroup())
+        {
+            for (auto const& bind : m_boundInstances)
+            {
+                if (plan.hasTransferBind && bind.first == plan.transferBind.mapId)
+                    continue;
+                DungeonPersistentState* state = bind.second.state;
+                if (!state)
+                    continue;
+                plan.resetGroupBinds.push_back(GroupDeletionMemberPlan::BindOp{
+                    bind.first, state->GetInstanceId(), bind.second.perm, state});
+
+                uint32 const instanceId = state->GetInstanceId();
+                if (state->CanReset())
+                {
+                    static SqlStatementID deleteInstance;
+                    static SqlStatementID deleteCharInstance;
+                    static SqlStatementID deleteGroupInstance;
+                    static SqlStatementID deleteCreatureRespawn;
+                    static SqlStatementID deleteGoRespawn;
+                    if (!appendDelete(deleteInstance,
+                                      "DELETE FROM `instance` WHERE `id` = ?",
+                                      instanceId, 0, false,
+                                      SqlAffectedRowsPolicy::Any) ||
+                        !appendDelete(deleteCharInstance,
+                                      "DELETE FROM `character_instance` WHERE `instance` = ?",
+                                      instanceId, 0, false,
+                                      SqlAffectedRowsPolicy::Any) ||
+                        !appendDelete(deleteGroupInstance,
+                                      "DELETE FROM `group_instance` WHERE `instance` = ?",
+                                      instanceId, 0, false,
+                                      SqlAffectedRowsPolicy::Any) ||
+                        !appendDelete(deleteCreatureRespawn,
+                                      "DELETE FROM `creature_respawn` WHERE `instance` = ?",
+                                      instanceId, 0, false,
+                                      SqlAffectedRowsPolicy::Any) ||
+                        !appendDelete(deleteGoRespawn,
+                                      "DELETE FROM `gameobject_respawn` WHERE `instance` = ?",
+                                      instanceId, 0, false,
+                                      SqlAffectedRowsPolicy::Any))
+                        return false;
+                }
+                else
+                {
+                    static SqlStatementID deleteBoundInstance;
+                    if (!appendDelete(deleteBoundInstance,
+                                      "DELETE FROM `group_instance` WHERE `instance` = ?",
+                                      instanceId, 0, false,
+                                      SqlAffectedRowsPolicy::Any))
+                        return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    if (!isBGGroup())
+    {
+        static SqlStatementID deleteMember;
+        if (!appendDelete(deleteMember,
+                          "DELETE FROM `group_member` WHERE `member_guid` = ? AND `group_id` = ?",
+                          lowguid, m_Id, true,
+                          SqlAffectedRowsPolicy::ExactlyOne))
+            return false;
+    }
+
+    if (m_leaderGuid != guid)
+    {
+        plan.kind = GroupDeletionMemberPlan::Kind::Remove;
+        return true;
+    }
+
+    plan.kind = GroupDeletionMemberPlan::Kind::Succession;
+
+    ObjectGuid first;
+    ObjectGuid chosen;
+    for (auto const& member : m_memberSlots)
+    {
+        if (member.guid == guid)
+            continue;
+        Player* player = sObjectMgr.GetPlayer(member.guid);
+        if (!player || player->GetGroup() != this)
+            continue;
+        if (isRaidGroup() && !member.assistant)
+        {
+            if (first.IsEmpty())
+                first = member.guid;
+            continue;
+        }
+        chosen = member.guid;
+        break;
+    }
+    if (chosen.IsEmpty())
+        chosen = first;
+    if (chosen.IsEmpty())
+        for (auto const& member : m_memberSlots)
+            if (member.guid != guid)
+            {
+                chosen = member.guid;
+                break;
+            }
+    if (chosen.IsEmpty())
+    {
+        context.Invalidate();
+        return false;
+    }
+
+    plan.newLeaderGuid = chosen.GetCounter();
+    member_citerator leaderSlot = _getMemberCSlot(chosen);
+    if (leaderSlot != m_memberSlots.end())
+        plan.newLeaderName = leaderSlot->name;
+
+    Player* newLeader = sObjectMgr.GetPlayer(chosen);
+    if (!isBGGroup())
+    {
+        static SqlStatementID deleteOldBinds;
+        static SqlStatementID deleteOneBind;
+        static SqlStatementID updateBinds;
+        static SqlStatementID copyBinds;
+        static SqlStatementID deleteSoloBinds;
+        static SqlStatementID updateGroupLeader;
+
+        SqlStatement prune = database->CreateStatement(
+            deleteOldBinds,
+            "DELETE FROM `group_instance` WHERE `leader_guid` = ? AND "
+            "(`permanent` = 1 OR `instance` IN (SELECT `instance` FROM `character_instance` WHERE `guid` = ?))");
+        prune.addUInt32(lowguid);
+        prune.addUInt32(chosen.GetCounter());
+        if (!prune.AppendToCheckedBatch(
+                context.Batch(), SqlAffectedRowsPolicy::Any))
+        {
+            context.Invalidate();
+            return false;
+        }
+
+        if (newLeader)
+        {
+            for (auto const& bind : m_boundInstances)
+            {
+                bool remove = false;
+                if (bind.second.perm)
+                    remove = true;
+                else if (newLeader->GetBoundInstance(bind.first))
+                    remove = true;
+                if (!remove)
+                    continue;
+                SqlStatement removeBind = database->CreateStatement(
+                    deleteOneBind,
+                    "DELETE FROM `group_instance` WHERE `leader_guid` = ? AND `instance` = ?");
+                removeBind.addUInt32(lowguid);
+                removeBind.addUInt32(bind.second.state->GetInstanceId());
+                if (!removeBind.AppendToCheckedBatch(
+                        context.Batch(), SqlAffectedRowsPolicy::Any))
+                {
+                    context.Invalidate();
+                    return false;
+                }
+                plan.removeGroupBinds.push_back(GroupDeletionMemberPlan::BindOp{
+                    bind.first, bind.second.state->GetInstanceId(),
+                    bind.second.perm, bind.second.state});
+            }
+        }
+
+        SqlStatement update = database->CreateStatement(
+            updateBinds,
+            "UPDATE `group_instance` SET `leader_guid` = ? WHERE `leader_guid` = ?");
+        update.addUInt32(chosen.GetCounter());
+        update.addUInt32(lowguid);
+        if (!update.AppendToCheckedBatch(
+                context.Batch(), SqlAffectedRowsPolicy::Any))
+        {
+            context.Invalidate();
+            return false;
+        }
+
+        if (newLeader)
+        {
+            bool hasBinds = false;
+            bool hasSolo = false;
+            for (auto const& bind : newLeader->GetBoundInstances())
+            {
+                hasBinds = true;
+                if (!bind.second.perm)
+                    hasSolo = true;
+                plan.addGroupBinds.push_back(GroupDeletionMemberPlan::BindOp{
+                    bind.first, bind.second.state->GetInstanceId(),
+                    bind.second.perm, bind.second.state});
+            }
+            if (hasBinds)
+            {
+                SqlStatement copy = database->CreateStatement(
+                    copyBinds,
+                    "INSERT INTO `group_instance` (`leader_guid`, `instance`, `permanent`) "
+                    "SELECT `guid`, `instance`, `permanent` FROM `character_instance` WHERE `guid` = ?");
+                copy.addUInt32(chosen.GetCounter());
+                if (!copy.AppendToCheckedBatch(
+                        context.Batch(), SqlAffectedRowsPolicy::Any))
+                {
+                    context.Invalidate();
+                    return false;
+                }
+            }
+            if (hasSolo)
+            {
+                SqlStatement clean = database->CreateStatement(
+                    deleteSoloBinds,
+                    "DELETE FROM `character_instance` WHERE `guid` = ? AND `permanent` = 0");
+                clean.addUInt32(chosen.GetCounter());
+                if (!clean.AppendToCheckedBatch(
+                        context.Batch(), SqlAffectedRowsPolicy::Any))
+                {
+                    context.Invalidate();
+                    return false;
+                }
+            }
+        }
+        else
+        {
+            SqlStatement copy = database->CreateStatement(
+                copyBinds,
+                "INSERT INTO `group_instance` (`leader_guid`, `instance`, `permanent`) "
+                "SELECT `guid`, `instance`, `permanent` FROM `character_instance` WHERE `guid` = ?");
+            copy.addUInt32(chosen.GetCounter());
+            if (!copy.AppendToCheckedBatch(
+                    context.Batch(), SqlAffectedRowsPolicy::Any))
+            {
+                context.Invalidate();
+                return false;
+            }
+        }
+
+        SqlStatement leader = database->CreateStatement(
+            updateGroupLeader,
+            "UPDATE `groups` SET `leader_guid` = ? WHERE `group_id` = ? AND `leader_guid` = ?");
+        leader.addUInt32(chosen.GetCounter());
+        leader.addUInt32(m_Id);
+        leader.addUInt32(lowguid);
+        if (!leader.AppendToCheckedBatch(
+                context.Batch(), SqlAffectedRowsPolicy::ExactlyOne))
+        {
+            context.Invalidate();
+            return false;
+        }
+    }
+    return true;
+}
+
+void Group::ApplyDeletionMemberRemoval(
+    GroupDeletionMemberPlan const& plan)
+{
+    ObjectGuid const memberGuid(HIGHGUID_PLAYER, plan.memberGuid);
+
+    if (plan.kind == GroupDeletionMemberPlan::Kind::Disband)
+    {
+        for (auto const& member : m_memberSlots)
+        {
+            Player* player = sObjectMgr.GetPlayer(member.guid);
+            if (!player)
+                continue;
+            if (isBGGroup())
+                player->RemoveFromBattleGroundRaid();
+            else
+            {
+                if (player->GetOriginalGroup() == this)
+                    player->SetOriginalGroup(nullptr);
+                else
+                    player->SetGroup(nullptr);
+            }
+            if (isRaidGroup())
+                player->m_Events.AddLambdaEventAtOffset(
+                    [player]() { player->UpdateForQuestWorldObjects(); }, 1);
+            if (Group* group = player->GetGroup())
+                group->SendUpdate();
+            else
+                player->GetSession()->SendPacket(
+                    std::make_unique<WorldPackets::Group::GroupList>());
+        }
+
+        if (IsInLFG())
+        {
+            sWorld.GetLFGQueue().GetMessager().AddMessage(
+                [groupId = GetId()](LFGQueue* queue) {
+                    queue->RemoveGroupFromQueue(groupId);
+                });
+        }
+
+        for (auto itr = RollId.begin(); itr != RollId.end(); itr = RollId.begin())
+            CountTheRoll(itr);
+        m_memberSlots.clear();
+        RemoveAllInvites();
+
+        if (plan.hasTransferBind)
+        {
+            if (Player* remainingPlayer = sObjectMgr.GetPlayer(
+                    ObjectGuid(HIGHGUID_PLAYER, plan.transferPlayerGuid)))
+                remainingPlayer->BindToInstance(
+                    plan.transferBind.state, plan.transferBind.permanent,
+                    /*load=*/true);
+            plan.transferBind.state->RemoveGroup(this);
+            m_boundInstances.erase(plan.transferBind.mapId);
+        }
+
+        for (GroupDeletionMemberPlan::BindOp const& op : plan.resetGroupBinds)
+        {
+            if (Map* map = sMapMgr.FindMap(op.state->GetMapId(), op.instanceId))
+                if (map->IsDungeon() && op.state->CanReset())
+                    ((DungeonMap*)map)->Reset(INSTANCE_RESET_GROUP_DISBAND);
+            m_boundInstances.erase(op.mapId);
+            op.state->RemoveGroup(this);
+        }
+
+        _updateLeaderFlag(true);
+        m_leaderGuid.Clear();
+        m_leaderName.clear();
+        return;
+    }
+
+    _removeRolls(memberGuid);
+    member_witerator slot = _getMemberWSlot(memberGuid);
+    if (slot != m_memberSlots.end())
+    {
+        SubGroupCounterDecrease(slot->group);
+        m_memberSlots.erase(slot);
+    }
+
+    if (plan.kind == GroupDeletionMemberPlan::Kind::Succession)
+    {
+        Player* newLeader = sObjectMgr.GetPlayer(
+            ObjectGuid(HIGHGUID_PLAYER, plan.newLeaderGuid));
+
+        for (GroupDeletionMemberPlan::BindOp const& op : plan.removeGroupBinds)
+        {
+            m_boundInstances.erase(op.mapId);
+            op.state->RemoveGroup(this);
+        }
+        for (GroupDeletionMemberPlan::BindOp const& op : plan.addGroupBinds)
+        {
+            InstanceGroupBind& bind = m_boundInstances[op.mapId];
+            bind.state = op.state;
+            bind.perm = op.permanent;
+            op.state->AddGroup(this);
+        }
+        if (newLeader)
+        {
+            auto& binds = newLeader->GetBoundInstances();
+            for (auto itr = binds.begin(); itr != binds.end();)
+            {
+                if (!itr->second.perm)
+                    newLeader->UnbindInstance(itr, true);
+                else
+                    ++itr;
+            }
+        }
+
+        _updateLeaderFlag(true);
+        m_leaderGuid = ObjectGuid(HIGHGUID_PLAYER, plan.newLeaderGuid);
+        m_leaderName = plan.newLeaderName;
+        m_leaderLastOnline = time(nullptr);
+        _updateLeaderFlag();
+
+        auto packet = std::make_unique<
+            WorldPackets::Group::GroupSetLeaderNotification>();
+        packet->leaderName = m_leaderName;
+        BroadcastPacket(std::move(packet), true);
+        sWorld.GetLFGQueue().GetMessager().AddMessage(
+            [groupId = GetId()](LFGQueue* queue) {
+                queue->RemoveGroupFromQueue(groupId);
+            });
+    }
+
+    // Legacy RemoveMember skips UpdateGroup when the leader changed (the LFG
+    // queue removal above already covers that case).
+    if (plan.kind == GroupDeletionMemberPlan::Kind::Remove && IsInLFG())
+        sLFGMgr.UpdateGroup(this, false, memberGuid);
+    SendUpdate();
 }
 
 void Group::_updateLeaderFlag(bool const remove /*= false*/)

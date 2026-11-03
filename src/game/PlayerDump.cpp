@@ -25,6 +25,10 @@
 #include "UpdateFields.h"
 #include "ObjectMgr.h"
 #include "AccountMgr.h"
+#include "PlayerName.h"
+#include "Database/DBCStores.h"
+#include "World.h"
+#include "Database/CharacterPersistenceRecovery.h"
 
 // Character Dump tables
 struct DumpTable
@@ -407,53 +411,220 @@ DumpReturn PlayerDumpWriter::WriteDump(std::string const& file, uint32 guid)
 }
 
 // Reading - High-level functions
+
+static bool ParseCharacterRowValues(std::string const& line,
+                                    std::vector<std::string>& values)
+{
+    std::size_t pos = line.find_first_not_of(" \t");
+    static char const prefix[] = "INSERT INTO `characters` VALUES (";
+    if (pos == std::string::npos ||
+        line.compare(pos, sizeof(prefix) - 1, prefix) != 0)
+        return false;
+    pos += sizeof(prefix) - 1;
+    values.clear();
+    while (true)
+    {
+        while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t'))
+            ++pos;
+        if (pos >= line.size())
+            return false;
+        if (line[pos] == '\'')
+        {
+            std::size_t const start = pos++;
+            bool closed = false;
+            while (pos < line.size())
+            {
+                if (line[pos] == '\\') { pos += 2; continue; }
+                if (line[pos] == '\'') { ++pos; closed = true; break; }
+                ++pos;
+            }
+            if (!closed)
+                return false;
+            values.push_back(line.substr(start, pos - start));
+        }
+        else if (line.compare(pos, 4, "NULL") == 0)
+        {
+            values.push_back("NULL");
+            pos += 4;
+        }
+        else
+            return false;
+        while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t'))
+            ++pos;
+        if (pos >= line.size())
+            return false;
+        if (line[pos] == ',') { ++pos; continue; }
+        if (line[pos] == ')')
+        {
+            ++pos;
+            while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t'))
+                ++pos;
+            if (pos < line.size() && line[pos] == ';')
+                ++pos;
+            while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t' || line[pos] == '\r' || line[pos] == '\n'))
+                ++pos;
+            return pos == line.size();
+        }
+        return false;
+    }
+}
+
+static int FindColumn(std::vector<std::string> const& columns, char const* name)
+{
+    for (std::size_t i = 0; i < columns.size(); ++i)
+        if (columns[i] == name)
+            return static_cast<int>(i);
+    return -1;
+}
+
+static std::string JoinSqlValues(std::vector<std::string> const& values)
+{
+    std::string result;
+    for (std::size_t i = 0; i < values.size(); ++i)
+    {
+        if (i) result += ", ";
+        result += values[i];
+    }
+    return result;
+}
+
+static bool ReadSingleDumpCount(QueryResult* result, uint64& count)
+{
+    if (!result || result->GetFieldCount() != 1 || result->GetRowCount() != 1)
+        return false;
+    Field* field = result->Fetch();
+    if (!field || field->IsNULL())
+        return false;
+    std::string text = field[0].GetCppString();
+    if (text.empty())
+        return false;
+    uint64 value = 0;
+    for (char c : text)
+    {
+        if (c < '0' || c > '9')
+            return false;
+        uint64 const digit = static_cast<uint64>(c - '0');
+        if (value > (UINT64_MAX - digit) / 10)
+            return false;
+        value = value * 10 + digit;
+    }
+    if (result->NextRow())
+        return false;
+    count = value;
+    return true;
+}
+
 #define ROLLBACK(DR) {CharacterDatabase.RollbackTransaction(); fclose(fin); return (DR);}
 
-DumpReturn PlayerDumpReader::LoadDump(std::string const& file, uint32 account, std::string name, uint32 guid)
+DumpReturn PlayerDumpReader::LoadDump(std::string const& file, uint32 account, std::string name, uint32 guid, PlayerDumpNamePolicy const& policy)
 {
+    if (guid != 0 &&
+        guid >= ObjectGuid::GetMaxCounter(HIGHGUID_PLAYER) - 2)
+        return DUMP_IDENTITY_ERROR;
+    if (account == 0)
+        return DUMP_DATABASE_ERROR;
+    AccountLifecycleLeasePtr admission =
+        GetAccountLifecycleRegistry().TryAcquire(
+            {account}, AccountLifecycleKind::Mutation);
+    if (!admission)
+        return DUMP_DATABASE_ERROR;
+
     // check character count
-    uint32 charcount = sAccountMgr.GetCharactersCount(account);
+    uint32 charcount = 0;
+    if (!sAccountMgr.TryGetCharactersCount(account, charcount))
+        return DUMP_DATABASE_ERROR;
     if (charcount >= 10)
         return DUMP_TOO_MANY_CHARS;
 
+    if (CharacterDatabase.InTransaction())
+        return DUMP_DATABASE_ERROR;
+    if (!CharacterDatabase.BeginTransaction())
+        return DUMP_DATABASE_ERROR;
+
     FILE* fin = fopen(file.c_str(), "r");
     if (!fin)
+    {
+        CharacterDatabase.RollbackTransaction();
         return DUMP_FILE_OPEN_ERROR;
+    }
 
     std::unique_ptr<QueryResult> result = nullptr;
     char newguid[20], chraccount[20], newpetid[20], currpetid[20], lastpetid[20];
 
-    // make sure the same guid doesn't already exist and is safe to use
+    // Target account must exist authoritatively.
+    uint64 accountCount = 0;
+    result = LoginDatabase.PQuery(
+        "SELECT COUNT(*) FROM `account` WHERE `id` = '%u'", account);
+    if (!ReadSingleDumpCount(result.get(), accountCount) || accountCount != 1)
+        ROLLBACK(DUMP_IDENTITY_ERROR);
+
+    // make sure the requested guid is absent; never substitute another guid
     bool incHighest = true;
-    if (guid != 0 && guid < sObjectMgr.m_CharGuids.GetNextAfterMaxUsed())
+    if (guid != 0)
     {
-        result = CharacterDatabase.PQuery("SELECT * FROM `characters` WHERE `guid` = '%u'", guid);
-        if (result)
-        {
-            guid = sObjectMgr.m_CharGuids.GetNextAfterMaxUsed();
-        }
-        else incHighest = false;
+        uint64 guidCount = 0;
+        result = CharacterDatabase.PQuery(
+            "SELECT COUNT(*) FROM `characters` WHERE `guid` = '%u'", guid);
+        if (!ReadSingleDumpCount(result.get(), guidCount) || guidCount != 0)
+            ROLLBACK(DUMP_IDENTITY_ERROR);
+        incHighest = false;
     }
     else
-        guid = sObjectMgr.m_CharGuids.GetNextAfterMaxUsed();
+        guid = sObjectMgr.GeneratePlayerLowGuid();
 
-    // normalize the name if specified and check if it exists
-    if (!normalizePlayerName(name))
-        name.clear();
-
-    if (ObjectMgr::CheckPlayerName(name, true) == CHAR_NAME_SUCCESS)
+    std::vector<std::string> characterColumns;
+    std::unique_ptr<QueryResult> schema = CharacterDatabase.PQuery(
+        "SHOW COLUMNS FROM `characters`");
+    if (!schema)
+        ROLLBACK(DUMP_DATABASE_ERROR);
+    while (true)
     {
-        CharacterDatabase.escape_string(name);              // for safe, we use name only for sql quearies anyway
-        result = CharacterDatabase.PQuery("SELECT * FROM `characters` WHERE `name` = '%s'", name.c_str());
-        if (result)
-        {
-            name.clear();                                      // use the one from the dump
-        }
+        Field* field = schema->Fetch();
+        if (!field)
+            break;
+        std::string column = field[0].GetCppString();
+        if (column.empty() ||
+            std::find(characterColumns.begin(), characterColumns.end(), column) !=
+                characterColumns.end())
+            ROLLBACK(DUMP_IDENTITY_ERROR);
+        characterColumns.push_back(column);
+        if (!schema->NextRow())
+            break;
     }
-    else
-        name.clear();
+    int guidColumn = FindColumn(characterColumns, "guid");
+    int accountColumn = FindColumn(characterColumns, "account");
+    int nameColumn = FindColumn(characterColumns, "name");
+    int onlineColumn = FindColumn(characterColumns, "online");
+    int deletedAccountColumn = FindColumn(characterColumns, "deleted_account");
+    int deletedNameColumn = FindColumn(characterColumns, "deleted_name");
+    int deletedTimeColumn = FindColumn(characterColumns, "deleted_time");
+    int generationColumn = FindColumn(characterColumns, "identity_generation");
+    if (characterColumns.empty() || guidColumn < 0 || accountColumn < 0 ||
+        nameColumn < 0 || onlineColumn < 0 || deletedAccountColumn < 0 ||
+        deletedNameColumn < 0 || deletedTimeColumn < 0 || generationColumn < 0)
+        ROLLBACK(DUMP_IDENTITY_ERROR);
 
-    // name encoded or empty
+    PlayerNameCharsets charsets =
+        PlayerNameCharsets::ForClient(policy.region, policy.locale);
+    std::string canonicalName = name;
+    if (!canonicalName.empty())
+    {
+        if (prepareFullPlayerName(canonicalName, GetPlayerNameLists(), charsets) !=
+            CHAR_NAME_SUCCESS)
+            ROLLBACK(DUMP_IDENTITY_ERROR);
+        if (!policy.allowReserved && sObjectMgr.IsReservedName(canonicalName))
+            ROLLBACK(DUMP_IDENTITY_ERROR);
+        std::string escapedName = canonicalName;
+        CharacterDatabase.escape_string(escapedName);
+        result = CharacterDatabase.PQuery(
+            "SELECT COUNT(*) FROM `character_name_ownership` WHERE BINARY `canonical_name`=BINARY '%s'",
+            escapedName.c_str());
+        uint64 nameCount = 0;
+        if (!ReadSingleDumpCount(result.get(), nameCount) || nameCount != 0)
+            ROLLBACK(DUMP_IDENTITY_ERROR);
+        name = canonicalName;
+    }
+    bool characterSeen = false;
 
     snprintf(newguid, 20, "%u", guid);
     snprintf(chraccount, 20, "%u", account);
@@ -463,13 +634,13 @@ DumpReturn PlayerDumpReader::LoadDump(std::string const& file, uint32 account, s
     std::map<uint32, uint32> items;
     std::map<uint32, uint32> mails;
     std::map<uint32, uint32> itemTexts;
+    std::vector<std::pair<uint32, std::string>> itemTextsToPublish;
     char buf[32000] = "";
 
     typedef std::map<uint32, uint32> PetIds;                // old->new petid relation
     typedef PetIds::value_type PetIdsPair;
     PetIds petids;
 
-    CharacterDatabase.BeginTransaction();
     while (!feof(fin))
     {
         if (!fgets(buf, 32000, fin))
@@ -515,6 +686,9 @@ DumpReturn PlayerDumpReader::LoadDump(std::string const& file, uint32 account, s
             ROLLBACK(DUMP_FILE_BROKEN);
         }
 
+        if (type != DTT_CHARACTER && !characterSeen)
+            ROLLBACK(DUMP_IDENTITY_ERROR);
+
         // change the data to server values
         switch (type)
         {
@@ -525,32 +699,71 @@ DumpReturn PlayerDumpReader::LoadDump(std::string const& file, uint32 account, s
 
             case DTT_CHARACTER:
             {
-                if (!changenth(line, 1, newguid))           // characters.guid update
-                    ROLLBACK(DUMP_FILE_BROKEN);
+                if (characterSeen)
+                    ROLLBACK(DUMP_IDENTITY_ERROR);
+                std::vector<std::string> values;
+                if (!ParseCharacterRowValues(line, values) ||
+                    values.size() != characterColumns.size())
+                    ROLLBACK(DUMP_IDENTITY_ERROR);
 
-                if (!changenth(line, 2, chraccount))        // characters.account update
-                    ROLLBACK(DUMP_FILE_BROKEN);
-
-                if (name.empty())
+                std::string candidate = name;
+                if (candidate.empty())
                 {
-                    // check if the original name already exists
-                    name = getnth(line, 3);                 // characters.name
-                    CharacterDatabase.escape_string(name);
-
-                    result = CharacterDatabase.PQuery("SELECT * FROM `characters` WHERE `name` = '%s'", name.c_str());
-                    if (result)
-                    {
-                        if (!changenth(line, 15, "16384"))  // characters.character_flags set to "rename on login"
-                            ROLLBACK(DUMP_FILE_BROKEN);
-                    }
+                    std::string const& token = values[nameColumn];
+                    if (token.size() < 2 || token.front() != '\'' ||
+                        token.back() != '\'' || token.find('\\') != std::string::npos)
+                        ROLLBACK(DUMP_IDENTITY_ERROR);
+                    candidate = token.substr(1, token.size() - 2);
+                    if (candidate.find('\'') != std::string::npos)
+                        ROLLBACK(DUMP_IDENTITY_ERROR);
                 }
-                else
-                {
-                    if (!changenth(line, 3, name.c_str()))  // characters.name update
-                        ROLLBACK(DUMP_FILE_BROKEN);
-                }
+                std::string canonical = candidate;
+                if (prepareFullPlayerName(canonical, GetPlayerNameLists(), charsets) !=
+                    CHAR_NAME_SUCCESS)
+                    ROLLBACK(DUMP_IDENTITY_ERROR);
+                if (!policy.allowReserved && sObjectMgr.IsReservedName(canonical))
+                    ROLLBACK(DUMP_IDENTITY_ERROR);
+                std::string escapedCanonical = canonical;
+                CharacterDatabase.escape_string(escapedCanonical);
+                result = CharacterDatabase.PQuery(
+                    "SELECT COUNT(*) FROM `character_name_ownership` WHERE BINARY `canonical_name`=BINARY '%s'",
+                    escapedCanonical.c_str());
+                uint64 ownershipCount = 0;
+                if (!ReadSingleDumpCount(result.get(), ownershipCount) ||
+                    ownershipCount != 0)
+                    ROLLBACK(DUMP_IDENTITY_ERROR);
+                result = CharacterDatabase.PQuery(
+                    "SELECT COUNT(*) FROM `characters` WHERE BINARY `name`=BINARY '%s'",
+                    escapedCanonical.c_str());
+                uint64 characterNameCount = 0;
+                if (!ReadSingleDumpCount(result.get(), characterNameCount) ||
+                    characterNameCount != 0)
+                    ROLLBACK(DUMP_IDENTITY_ERROR);
+                if (values[deletedTimeColumn] != "NULL")
+                    ROLLBACK(DUMP_IDENTITY_ERROR);
 
-                break;
+                values[guidColumn] = newguid;
+                values[accountColumn] = chraccount;
+                values[nameColumn] = "'" + escapedCanonical + "'";
+                values[onlineColumn] = "0";
+                values[deletedAccountColumn] = "NULL";
+                values[deletedNameColumn] = "NULL";
+                values[deletedTimeColumn] = "NULL";
+                values[generationColumn] = "1";
+                line = "INSERT INTO `characters` VALUES (" +
+                    JoinSqlValues(values) + ");";
+                if (!CharacterDatabase.Execute(line.c_str()))
+                    ROLLBACK(DUMP_DATABASE_ERROR);
+                static SqlStatementID insertOwnership;
+                SqlStatement ownership = CharacterDatabase.CreateStatement(
+                    insertOwnership,
+                    "INSERT INTO `character_name_ownership` (`canonical_name`,`guid`) VALUES (?,?)");
+                ownership.addString(canonical);
+                ownership.addUInt32(guid);
+                if (!ownership.Execute())
+                    ROLLBACK(DUMP_IDENTITY_ERROR);
+                characterSeen = true;
+                continue;
             }
             case DTT_INVENTORY:
             {
@@ -661,7 +874,7 @@ DumpReturn PlayerDumpReader::LoadDump(std::string const& file, uint32 account, s
                 // add it to cache
                 uint32 id = atoi(getnth(line, 1).c_str());
                 std::string text = getnth(line, 2);
-                sObjectMgr.AddItemText(id, text);
+                itemTextsToPublish.emplace_back(id, text);
                 break;
             }
             default:
@@ -673,7 +886,19 @@ DumpReturn PlayerDumpReader::LoadDump(std::string const& file, uint32 account, s
             ROLLBACK(DUMP_FILE_BROKEN);
     }
 
-    CharacterDatabase.CommitTransaction();
+    if (!characterSeen)
+        ROLLBACK(DUMP_IDENTITY_ERROR);
+    if (!CharacterDatabase.CommitTransactionDirect())
+    {
+        BlockCharacterRecovery(CharacterRecoveryRecord{
+            CharacterRecoveryKind::WholeSave, {}, {account}, 0,
+            "player dump direct commit failed or outcome unknown"});
+        fclose(fin);
+        return DUMP_DATABASE_ERROR;
+    }
+
+    for (auto const& itemText : itemTextsToPublish)
+        sObjectMgr.AddItemText(itemText.first, itemText.second);
 
     //FIXME: current code with post-updating guids not safe for future per-map threads
     uint64 newMaxItemGuid = sObjectMgr.m_ItemGuids.GetNextAfterMaxUsed() + uint64(items.size());
@@ -688,8 +913,26 @@ DumpReturn PlayerDumpReader::LoadDump(std::string const& file, uint32 account, s
     MANGOS_ASSERT(newMaxItemTextId < UINT32_MAX);
     sObjectMgr.m_ItemTextIds.SetMaxUsedGuid(newMaxItemTextId, "Item Text");
 
-    if (incHighest)
-        sObjectMgr.m_CharGuids.SetMaxUsedGuid(sObjectMgr.m_CharGuids.GetNextAfterMaxUsed() + 1, "Character");
+    if (!incHighest && guid >= sObjectMgr.m_CharGuids.GetNextAfterMaxUsed())
+        sObjectMgr.m_CharGuids.SetMaxUsedGuid(guid, "Character");
+
+    uint32 const importedGuid = guid;
+    if (!sObjectMgr.LoadPlayerCacheData(importedGuid))
+    {
+        BlockCharacterRecovery(CharacterRecoveryRecord{
+            CharacterRecoveryKind::WholeSave, {importedGuid}, {account}, 1,
+            "player dump committed but cache publication failed"});
+        fclose(fin);
+        return DUMP_DATABASE_ERROR;
+    }
+    if (!sWorld.UpdateRealmCharCount(account, admission.get()))
+    {
+        BlockCharacterRecovery(CharacterRecoveryRecord{
+            CharacterRecoveryKind::WholeSave, {importedGuid}, {account}, 1,
+            "player dump committed but realm count publication failed"});
+        fclose(fin);
+        return DUMP_DATABASE_ERROR;
+    }
 
     fclose(fin);
 

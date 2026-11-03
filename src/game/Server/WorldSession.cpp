@@ -22,6 +22,8 @@
 #include "WorldSocket.h"
 #include "Common.h"
 #include "Database/DatabaseEnv.h"
+#include "Database/SqlCheckedBatch.h"
+#include "Database/SqlPreparedStatement.h"
 #include "Log.h"
 #include "Opcodes.h"
 #include "WorldPacket.h"
@@ -69,12 +71,13 @@ bool MapSessionFilter::Process(std::unique_ptr<ClientPacket const> const& packet
 static uint32 g_sessionCounter = 1;
 
 // WorldSession constructor
-WorldSession::WorldSession(uint32 id, std::shared_ptr<WorldSocket> sock, AccountTypes sec, time_t mute_time, LocaleConstant locale) :
+WorldSession::WorldSession(uint32 id, std::shared_ptr<WorldSocket> sock, AccountTypes sec, time_t mute_time, LocaleConstant locale, uint8 clientRegion) :
     m_guid(g_sessionCounter++), m_muteTime(mute_time), m_connected(true), m_disconnectTimer(0), m_who_recvd(false), m_ah_list_recvd(false),
     m_accountFlags(0), m_idleTime(WorldTimer::getMSTime()), _player(nullptr), m_socket(sock), m_security(sec), m_accountId(id),
     m_exhaustionState(0), m_createTime(time(nullptr)), m_previousPlayTime(0), m_logoutTime(0), m_inQueue(false),
     m_playerLoading(false), m_playerLogout(false), m_playerRecentlyLogout(false), m_playerSave(false), m_sessionDbcLocale(sWorld.GetAvailableDbcLocale(locale)),
-    m_sessionDbLocaleIndex(sObjectMgr.GetIndexForLocale(locale)), m_latency(0), m_tutorialState(TUTORIALDATA_UNCHANGED), m_warden(nullptr), m_cheatData(nullptr),
+    m_sessionDbLocaleIndex(sObjectMgr.GetIndexForLocale(locale)), m_clientLocale(locale), m_clientRegion(clientRegion),
+    m_latency(0), m_tutorialState(TUTORIALDATA_UNCHANGED), m_warden(nullptr), m_cheatData(nullptr),
     m_bot(nullptr), m_clientOS(CLIENT_OS_UNKNOWN), m_clientPlatform(CLIENT_PLATFORM_UNKNOWN), m_gameBuild(0), m_verifiedEmail(true),
     m_charactersCount(std::numeric_limits<uint32>::max()), m_characterMaxLevel(0), m_lastPubChannelMsgTime(0), m_moveRejectTime(0), m_masterPlayer(nullptr), m_receivedPacketType{},
     m_floodPacketsCount{}, m_tutorials{}
@@ -856,7 +859,12 @@ void WorldSession::LogoutPlayer(bool Save)
             m_masterPlayer->SetSocial(nullptr);
         }
 
-        m_masterPlayer->SaveToDB();
+        // The composed Player save above already staged MasterPlayer actions
+        // and mail.  Only a representation whose staged data was not published
+        // (save skipped, disabled or failed) performs its own guarded save here,
+        // before destruction and while its data is still alive.
+        if (m_masterPlayer->HasPendingSave())
+            m_masterPlayer->SaveToDB();
         delete m_masterPlayer;
         m_masterPlayer = nullptr;
     }
@@ -1146,6 +1154,50 @@ void WorldSession::SaveTutorialsData()
             break;
     }
 
+    m_tutorialState = TUTORIALDATA_UNCHANGED;
+}
+
+bool WorldSession::AppendTutorialsDataToCheckedBatch(
+    SqlCheckedBatch& batch) const
+{
+    static SqlStatementID updTutorial;
+    static SqlStatementID insTutorial;
+
+    switch (m_tutorialState)
+    {
+        case TUTORIALDATA_CHANGED:
+        {
+            SqlStatement stmt = CharacterDatabase.CreateStatement(
+                updTutorial,
+                "UPDATE `character_tutorial` SET `tut0`=?, `tut1`=?, "
+                "`tut2`=?, `tut3`=?, `tut4`=?, `tut5`=?, `tut6`=?, "
+                "`tut7`=? WHERE `account` = ?");
+            for (uint32 tutorial : m_tutorials)
+                stmt.addUInt32(tutorial);
+            stmt.addUInt32(GetAccountId());
+            return stmt.AppendToCheckedBatch(batch);
+        }
+        case TUTORIALDATA_NEW:
+        {
+            SqlStatement stmt = CharacterDatabase.CreateStatement(
+                insTutorial,
+                "INSERT INTO `character_tutorial` (`account`, `tut0`, "
+                "`tut1`, `tut2`, `tut3`, `tut4`, `tut5`, `tut6`, `tut7`) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            stmt.addUInt32(GetAccountId());
+            for (uint32 tutorial : m_tutorials)
+                stmt.addUInt32(tutorial);
+            return stmt.AppendToCheckedBatch(
+                batch, SqlAffectedRowsPolicy::ExactlyOne);
+        }
+        case TUTORIALDATA_UNCHANGED:
+            return true;
+    }
+    return false;
+}
+
+void WorldSession::MarkTutorialsDataSaved()
+{
     m_tutorialState = TUTORIALDATA_UNCHANGED;
 }
 

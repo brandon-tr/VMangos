@@ -62,6 +62,15 @@ enum DumpReturn
     DUMP_TOO_MANY_CHARS,
     DUMP_UNEXPECTED_END,
     DUMP_FILE_BROKEN,
+    DUMP_DATABASE_ERROR,
+    DUMP_IDENTITY_ERROR,
+};
+
+struct PlayerDumpNamePolicy
+{
+    uint8 region;
+    std::size_t locale;
+    bool allowReserved;
 };
 
 class PlayerDump
@@ -95,7 +104,8 @@ class PlayerDumpReader : public PlayerDump
     public:
         PlayerDumpReader() {}
 
-        DumpReturn LoadDump(std::string const& file, uint32 account, std::string name, uint32 guid);
+        DumpReturn LoadDump(std::string const& file, uint32 account, std::string name, uint32 guid,
+                          PlayerDumpNamePolicy const& policy);
 };
 
 #endif

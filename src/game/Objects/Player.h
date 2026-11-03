@@ -61,6 +61,9 @@ class TradeData;
 class DungeonPersistentState;
 class Spell;
 class Item;
+class CharacterPersistenceContext;
+struct CharacterDeletionSnapshot;
+class AccountLifecycleLease;
 class ZoneScript;
 class PlayerAI;
 class PlayerBroadcaster;
@@ -901,6 +904,7 @@ class Player final: public Unit
         static uint32 GetAttackBySlot(uint8 slot);        // MAX_ATTACK if not weapon slot
         uint32 GetHighestKnownArmorProficiency() const;
         std::vector<Item*>& GetItemUpdateQueue() { return m_itemUpdateQueue; }
+        bool IsItemUpdateQueueBlocked() const { return m_itemUpdateQueueBlocked; }
         static bool IsMainHandPos(uint16 pos) { return uint8(pos >> 8) == INVENTORY_SLOT_BAG_0 && uint8(pos & 255) == EQUIPMENT_SLOT_MAINHAND; }
         static bool IsInventoryPos(uint16 pos) { return IsInventoryPos(pos >> 8, pos & 255); }
         static bool IsInventoryPos(uint8 bag, uint8 slot);
@@ -1262,13 +1266,40 @@ class Player final: public Unit
         bool m_saveDisabled; // used for temporary bots and faction change
     public:
         // Saves a new character directly in the database, without creating a Player object in memory.
-        static bool SaveNewPlayer(WorldSession* session, uint32 guidlow, std::string const& name, uint8 raceId, uint8 classId, uint8 gender, uint8 skin, uint8 face, uint8 hairStyle, uint8 hairColor, uint8 facialHair);
+        static uint8 SaveNewPlayer(WorldSession* session, uint32 guidlow, std::string const& name, uint8 raceId, uint8 classId, uint8 gender, uint8 skin, uint8 face, uint8 hairStyle, uint8 hairColor, uint8 facialHair, AccountLifecycleLease const* lease = nullptr);
+        bool AppendBGData(CharacterPersistenceContext& context);
+        bool AppendQuestStatus(CharacterPersistenceContext& context,
+                               uint64 gameTimeSeconds);
+        bool AppendSkills(CharacterPersistenceContext& context);
+        bool AppendSpells(CharacterPersistenceContext& context);
+        bool AppendSpellCooldowns(CharacterPersistenceContext& context) const;
+        bool AppendAuras(CharacterPersistenceContext& context);
+        bool AppendStats(CharacterPersistenceContext& context,
+                         uint32 minimumLevel);
+        // Composed checked-save seams.  The caller must stage exactly this
+        // character's identity guard before calling any of them.
+        bool AppendCharacterRowToDB(CharacterPersistenceContext& context,
+                                    bool online);
+        bool AppendInventoryToDB(CharacterPersistenceContext& context);
+        bool AppendGoldToDB(CharacterPersistenceContext& context);
+        // Stages a projected balance for an operation that applies the money
+        // change only in its commit completion.
+        bool AppendGoldProjectedToDB(CharacterPersistenceContext& context,
+                                     uint32 projectedMoney);
+        bool AppendSaveToDB(CharacterPersistenceContext& context, bool online,
+                            bool includeStats);
+        // Registers the single post-commit identity-generation publication for
+        // this save context.  Must be called after every dirty-state
+        // acknowledgment of the same context so those still observe the staged
+        // generation.
+        void AppendIdentityGenerationPublication(
+            CharacterPersistenceContext& context);
         void SaveToDB(bool online = true, bool force = false);
         void SaveInventoryAndGoldToDB();                    // fast save function for item/money cheating preventing
         void SaveGoldToDB();
         static void SavePositionInDB(ObjectGuid guid, uint32 mapId, float x, float y, float z, float o, uint32 zone);
 
-        static void DeleteFromDB(ObjectGuid playerGuid, uint32 accountId, bool updateRealmChars = true, bool deleteFinally = false);
+        static bool DeleteFromDB(ObjectGuid playerGuid, uint32 accountId, bool updateRealmChars = true, bool deleteFinally = false, CharacterDeletionSnapshot const* expected = nullptr, AccountLifecycleLease const* lease = nullptr);
         static void DeleteOldCharacters();
         static void DeleteOldCharacters(uint32 keepDays);
 
@@ -2119,7 +2150,10 @@ class Player final: public Unit
         void UpdateLocalChannels(uint32 newZone);
         std::string m_name;
         uint64 m_knownLanguagesMask;
+        uint64 m_identityGeneration;
     public:
+        uint64 GetIdentityGeneration() const { return m_identityGeneration; }
+        void SetIdentityGeneration(uint64 generation) { m_identityGeneration = generation; }
         void JoinedChannel(Channel* c);
         void LeftChannel(Channel* c);
         void CleanupChannels();

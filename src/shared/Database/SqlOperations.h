@@ -27,7 +27,10 @@
 #include "LockedQueue.h"
 #include <queue>
 #include "DatabaseCallback.h"
+#include "SqlCheckedBatch.h"
+#include "SqlWrite.h"
 #include <memory>
+#include <string>
 
 // ---- BASE ---
 
@@ -123,6 +126,40 @@ class SqlQuery : public SqlOperation
             : m_sql(mangos_strdup(sql)), m_callback(callback), m_queue(queue) {}
         ~SqlQuery() { char* tofree = const_cast<char*>(m_sql); delete [] tofree; }
         bool Execute(SqlConnection* conn);
+};
+
+/// One checked write, followed by a typed completion queued on the database's
+/// existing result queue.  The SQL worker never invokes the completion itself.
+class SqlCheckedWrite : public SqlOperation
+{
+    public:
+        SqlCheckedWrite(std::string sql, uint32 serialId,
+                        SqlWriteCompletion completion,
+                        SqlResultQueue* resultQueue)
+            : SqlOperation(serialId), m_sql(std::move(sql)),
+              m_completion(std::move(completion)), m_resultQueue(resultQueue) {}
+
+        bool Execute(SqlConnection* conn) override;
+
+    private:
+        std::string m_sql;
+        SqlWriteCompletion m_completion;
+        SqlResultQueue* m_resultQueue;
+};
+
+class SqlCheckedBatchOperation : public SqlOperation
+{
+    public:
+        SqlCheckedBatchOperation(SqlCheckedBatch batch,
+                                 SqlBatchCompletion completion,
+                                 SqlResultQueue* resultQueue);
+
+        bool Execute(SqlConnection* conn) override;
+
+    private:
+        SqlCheckedBatch m_batch;
+        SqlBatchCompletion m_completion;
+        SqlResultQueue* m_resultQueue;
 };
 
 class SqlQueryHolder

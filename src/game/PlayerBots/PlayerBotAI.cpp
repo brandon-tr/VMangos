@@ -16,6 +16,7 @@
 
 #include "PlayerBotMgr.h"
 #include "PlayerBotAI.h"
+#include "Database/CharacterPersistenceRecovery.h"
 #include "Player.h"
 #include "Log.h"
 #include "SocialMgr.h"
@@ -75,8 +76,20 @@ enum
 bool PlayerBotAI::SpawnNewPlayer(WorldSession* sess, uint8 class_, uint32 race_, uint32 mapId, uint32 instanceId, float x, float y, float z, float o, Player* pClone)
 {
     ASSERT(botEntry);
-    std::string name = sObjectMgr.GenerateFreePlayerName();
-    normalizePlayerName(name);
+    if (!sess || sess->GetAccountId() == 0)
+        return false;
+    AccountLifecycleLeasePtr admission =
+        GetAccountLifecycleRegistry().TryAcquire(
+            {sess->GetAccountId()}, AccountLifecycleKind::Mutation);
+    if (!admission)
+        return false;
+    PlayerNameReservation reservation = sObjectMgr.ReserveFreePlayerName();
+    if (!reservation)
+    {
+        sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "PlayerBotAI::SpawnNewPlayer: unable to allocate a canonical player name!");
+        return false;
+    }
+    std::string name = reservation.Name();
 
     uint8 gender;
     uint8 skin;
@@ -131,21 +144,27 @@ bool PlayerBotAI::SpawnNewPlayer(WorldSession* sess, uint8 class_, uint32 race_,
     newChar->SetMap(map);
     newChar->SaveRecallPosition();
     newChar->CreatePacketBroadcaster();
-    MasterPlayer* mPlayer = new MasterPlayer(sess);
-    mPlayer->LoadPlayer(newChar);
-    mPlayer->SetSocial(sSocialMgr.LoadFromDB(nullptr, newChar->GetObjectGuid()));
     if (!newChar->GetMap()->Add(newChar))
     {
         sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "PlayerBotAI::SpawnNewPlayer: Unable to add player to map!");
         delete newChar;
         return false;
     }
-    sObjectMgr.InsertPlayerInCache(newChar);
+    if (!sObjectMgr.InsertPlayerInCache(newChar))
+    {
+        sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "PlayerBotAI::SpawnNewPlayer: Unable to insert player into cache!");
+        map->Remove(newChar, true);
+        return false;
+    }
+    MasterPlayer* mPlayer = new MasterPlayer(sess);
+    mPlayer->LoadPlayer(newChar);
+    mPlayer->SetSocial(sSocialMgr.LoadFromDB(nullptr, newChar->GetObjectGuid()));
     sess->SetPlayer(newChar);
     sess->SetMasterPlayer(mPlayer);
     sObjectAccessor.AddObject(newChar);
     newChar->SetCanModifyStats(true);
     newChar->UpdateAllStats();
+    reservation.Release();
     return true;
 }
 bool MageOrgrimmarAttackerAI::OnSessionLoaded(PlayerBotEntry* entry, WorldSession* sess)

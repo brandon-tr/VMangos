@@ -1,0 +1,10 @@
+[package]
+name = "name-parity-driver"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+benilla-ui = { path = "@CLIENT_UI@" }

@@ -55,6 +55,7 @@ class QueryResult;
 class World;
 class MovementBroadcaster;
 struct PlayerTransactionData;
+class AccountLifecycleLease;
 
 World& GetSWorld();
 
@@ -829,7 +830,9 @@ class World
         void UpdateResultQueue();
         void InitResultQueue();
 
-        void UpdateRealmCharCount(uint32 accountId);
+        bool UpdateRealmCharCount(uint32 accountId,
+            AccountLifecycleLease const* lease = nullptr,
+            uint32* publishedCount = nullptr);
 
         LocaleConstant GetAvailableDbcLocale(LocaleConstant locale) const { if (m_availableDbcLocaleMask & (1 << locale)) return locale; else return m_defaultDbcLocale; }
 
@@ -897,8 +900,6 @@ class World
         LFGQueue& GetLFGQueue() { return m_lfgQueue; }
     protected:
         void _UpdateGameTime();
-        // callback for UpdateRealmCharacters
-        void _UpdateRealmCharCount(std::unique_ptr<QueryResult> resultCharCount, uint32 accountId);
 
     private:
         void setConfig(eConfigUInt32Values index, char const* fieldname, uint32 defvalue);

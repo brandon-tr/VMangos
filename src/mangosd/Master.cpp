@@ -36,6 +36,7 @@
 #include "SystemConfig.h"
 #include "Config/Config.h"
 #include "Database/DatabaseEnv.h"
+#include "Database/CharacterNameSchema.h"
 #include "CliRunnable.h"
 #include "remote/RemoteAccess/RASocket.h"
 #include "remote/soap/MaNGOSsoap.h"
@@ -484,6 +485,33 @@ bool Master::_StartDB()
         !StartDB("Login", LoginDatabase, MIGRATIONS_LOGON) ||
         !StartDB("Logs", LogsDatabase, MIGRATIONS_LOGS))
     {
+        WorldDatabase.HaltDelayThread();
+        CharacterDatabase.HaltDelayThread();
+        LoginDatabase.HaltDelayThread();
+        LogsDatabase.HaltDelayThread();
+        return false;
+    }
+
+    // Character-name schema and ownership must be valid before any startup
+    // cleanup writes to the login or character database.
+    std::string schemaReason;
+    if (!CheckCharacterNameSchema(CharacterDatabase, schemaReason))
+    {
+        sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                 "Character name schema prerequisite failed: %s",
+                 schemaReason.c_str());
+        WorldDatabase.HaltDelayThread();
+        CharacterDatabase.HaltDelayThread();
+        LoginDatabase.HaltDelayThread();
+        LogsDatabase.HaltDelayThread();
+        return false;
+    }
+
+    if (!CheckCharacterNameOwnership(CharacterDatabase, schemaReason))
+    {
+        sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                 "Character name ownership prerequisite failed: %s",
+                 schemaReason.c_str());
         WorldDatabase.HaltDelayThread();
         CharacterDatabase.HaltDelayThread();
         LoginDatabase.HaltDelayThread();

@@ -25,7 +25,9 @@
 #include <unordered_map>
 #include "Database/SqlDelayThread.h"
 #include "Policies/ThreadingModel.h"
+#include "SqlCheckedBatch.h"
 #include "SqlPreparedStatement.h"
+#include "SqlWrite.h"
 #include "ThreadSpecificPtr.h"
 #include <memory>
 #include <thread>
@@ -58,6 +60,12 @@ class SqlConnection
 
         //public methods for making requests
         virtual bool Execute(std::string const& sql) = 0;
+        virtual SqlWriteResult ExecuteChecked(std::string const& sql) = 0;
+        virtual SqlWriteResult ExecutePreparedChecked(
+            std::string const& sql,
+            std::vector<SqlStmtFieldData> const& parameters) = 0;
+        virtual bool IsConnected() const = 0;
+        virtual void DiscardConnection() = 0;
 
         //escape string generation
         virtual unsigned long escape_string(char* to, char const* from, unsigned long length) { strncpy(to,from,length); return length; }
@@ -161,6 +169,21 @@ class Database
         }
 
         bool DirectPExecute(char const* format,...) ATTR_PRINTF(2,3);
+
+        /// Execute one trusted DML statement with a checked outcome.  This is
+        /// unrelated to the legacy bool APIs and is not queued.
+        SqlWriteResult DirectExecuteChecked(std::string const& sql);
+
+        /// Queue a checked write and deliver its typed result through the
+        /// existing result queue.  True means accepted/executed for delivery,
+        /// never that the write succeeded.
+        bool AsyncExecuteChecked(std::string sql, uint32 serialId,
+                                 SqlWriteCompletion completion);
+
+        SqlCheckedBatch CreateCheckedBatch(uint32 serialId = 0);
+        SqlBatchResult DirectExecuteCheckedBatch(SqlCheckedBatch batch);
+        bool AsyncExecuteCheckedBatch(SqlCheckedBatch batch,
+                                      SqlBatchCompletion completion);
 
         // Async queries and query holders, implemented in DatabaseImpl.h
 
@@ -311,6 +334,9 @@ class Database
         //query function for prepared statements
         bool ExecuteStmt(SqlStatementID const& id, SqlStmtParameters* params);
         bool DirectExecuteStmt(SqlStatementID const& id, SqlStmtParameters* params);
+        SqlWriteResult DirectExecutePreparedChecked(
+            std::string const& sql,
+            std::vector<SqlStmtFieldData> const& parameters);
 
         //connection helper counters
         int m_nQueryConnPoolSize;                                           // Current size of query connection pool

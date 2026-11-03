@@ -38,6 +38,9 @@ set (shared_SRCS
     Timer.h
     Utilities/Random.h
     Util.h
+    PlayerName.h
+    PlayerNameHangul.h
+    PlayerNamePattern.h
     Config/Config.h
     Config/ConfigEnv.h
     Crypto/BigNumber.h
@@ -73,6 +76,11 @@ set (shared_SRCS
     Database/QueryResultMysql.h
     Database/SqlDelayThread.h
     Database/SqlOperations.h
+    Database/SqlCheckedBatch.h
+    Database/SqlCheckedBatchExecution.h
+    Database/SqlPreparedWrite.h
+    Database/SqlTransactionExecution.h
+    Database/SqlWrite.h
     Database/SqlPreparedStatement.h
     Database/SQLStorage.h
     Database/SQLStorageImpl.h
@@ -90,6 +98,8 @@ set (shared_SRCS
     ServiceWin32.cpp
     ThreadPool.cpp
     Util.cpp
+    PlayerName.cpp
+    PlayerNamePattern.cpp
     Utilities/Random.cpp
     Duration.h
     Auth/AuthCrypt.h
@@ -102,6 +112,9 @@ set (shared_SRCS
     Database/QueryResultMysql.cpp
     Database/SqlDelayThread.cpp
     Database/SqlOperations.cpp
+    Database/SqlCheckedBatch.cpp
+    Database/SqlPreparedWrite.cpp
+    Database/SqlWrite.cpp
     Database/SqlPreparedStatement.cpp
     Database/SQLStorage.cpp
     Multithreading/Messager.cpp

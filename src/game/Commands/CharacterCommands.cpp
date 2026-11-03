@@ -16,6 +16,11 @@
 
 #include "Common.h"
 #include "Database/DatabaseEnv.h"
+#include "Database/CharacterPersistenceContext.h"
+#include "Database/CharacterIdentityPersistence.h"
+#include "Database/CharacterPersistenceRecovery.h"
+#include "Database/SqlCheckedBatch.h"
+#include "Database/SqlPreparedStatement.h"
 #include "Database/DatabaseImpl.h"
 #include "World.h"
 #include "Player.h"
@@ -24,6 +29,7 @@
 #include "Bag.h"
 #include "Opcodes.h"
 #include "Chat.h"
+#include "PlayerName.h"
 #include "ObjectAccessor.h"
 #include "Language.h"
 #include "AccountMgr.h"
@@ -32,8 +38,11 @@
 #include "AsyncCommandHandlers.h"
 #include "WaypointMovementGenerator.h"
 #include "PlayerDump.h"
+#include "Database/DBCStores.h"
 #include "CharacterDatabaseCache.h"
 #include "Config/Config.h"
+
+#include <limits>
 
 #include <regex>
 #include <iterator>
@@ -1349,6 +1358,71 @@ bool ChatHandler::HandleTaxiCheatCommand(char* args)
     return true;
 }
 
+static bool ParseDeletedCharacterGuid(std::string const& text, uint32& guid)
+{
+    if (text.empty())
+        return false;
+    uint64 value = 0;
+    for (char c : text)
+    {
+        if (c < '0' || c > '9')
+            return false;
+        value = value * 10 + uint64(c - '0');
+        if (value > std::numeric_limits<uint32>::max())
+            return false;
+    }
+    if (value == 0)
+        return false;
+    guid = static_cast<uint32>(value);
+    return true;
+}
+
+static bool IsExactOptionToken(char const* args, char const* option)
+{
+    while (args && *args && (*args == ' ' || *args == '\t'))
+        ++args;
+    if (!args || !*args)
+        return false;
+    std::size_t const length = std::strlen(option);
+    return std::strncmp(args, option, length) == 0 &&
+        (args[length] == '\0' || args[length] == ' ' || args[length] == '\t');
+}
+
+static bool ParseNameProfile(std::string const& text, uint8& region,
+                             std::size_t& locale)
+{
+    std::size_t const colon = text.find(':');
+    if (colon == std::string::npos || text.find(':', colon + 1) != std::string::npos)
+        return false;
+    std::string const regionText = text.substr(0, colon);
+    std::string const localeText = text.substr(colon + 1);
+    uint32 regionValue = 0;
+    uint32 localeValue = 0;
+    bool const regionOk = !regionText.empty() &&
+        std::all_of(regionText.begin(), regionText.end(),
+                    [](char c) { return c >= '0' && c <= '9'; });
+    bool const localeOk = !localeText.empty() &&
+        std::all_of(localeText.begin(), localeText.end(),
+                    [](char c) { return c >= '0' && c <= '9'; });
+    if (!regionOk || !localeOk)
+        return false;
+    for (char c : regionText)
+    {
+        regionValue = regionValue * 10 + uint32(c - '0');
+        if (regionValue > 5)
+            return false;
+    }
+    for (char c : localeText)
+    {
+        localeValue = localeValue * 10 + uint32(c - '0');
+        if (localeValue > 7)
+            return false;
+    }
+    region = static_cast<uint8>(regionValue);
+    locale = localeValue;
+    return true;
+}
+
 /**
  * Collects all GUIDs (and related info) from deleted characters which are still in the database.
  *
@@ -1366,23 +1440,29 @@ bool ChatHandler::GetDeletedCharacterInfoList(DeletedInfoList& foundList, bool u
         {
             // search by GUID
             if (isNumeric(searchString))
-                resultChar = CharacterDatabase.PQuery("SELECT `guid`, `deleted_name`, `deleted_account`, `deleted_time` FROM `characters` WHERE `deleted_time` IS NOT NULL AND `guid` = %u LIMIT 0,50", uint32(atoi(searchString.c_str())));
-            // search by name
+            {
+                uint32 guid = 0;
+                if (!ParseDeletedCharacterGuid(searchString, guid))
+                    return false;
+                resultChar = CharacterDatabase.PQuery("SELECT `guid`, `deleted_name`, `deleted_account`, `deleted_time`, `identity_generation` FROM `characters` WHERE `deleted_time` IS NOT NULL AND `guid` = %u LIMIT 0,50", guid);
+            }
+            // search by exact canonical full name
             else
             {
-                if (!normalizePlayerName(searchString))
+                if (!normalizeFullPlayerNameForLookup(searchString) ||
+                    !isCanonicalFullPlayerName(searchString))
                     return false;
 
                 CharacterDatabase.escape_string(searchString);
 
-                resultChar = CharacterDatabase.PQuery("SELECT `guid`, `deleted_name`, `deleted_account`, `deleted_time` FROM `characters` WHERE `deleted_time` IS NOT NULL AND `deleted_name` LIKE CONCAT('%s','%%')" " LIMIT 0,50", searchString.c_str());
+                resultChar = CharacterDatabase.PQuery("SELECT `guid`, `deleted_name`, `deleted_account`, `deleted_time`, `identity_generation` FROM `characters` WHERE `deleted_time` IS NOT NULL AND BINARY `deleted_name` = BINARY '%s' LIMIT 0,50", searchString.c_str());
             }
         }
         else
         {
             // search by account id
             if (isNumeric(searchString))
-                resultChar = CharacterDatabase.PQuery("SELECT `guid`, `deleted_name`, `deleted_account`, `deleted_time` FROM `characters` WHERE `deleted_time` IS NOT NULL AND `deleted_account` = %u LIMIT 0,50", uint32(atoi(searchString.c_str())));
+                resultChar = CharacterDatabase.PQuery("SELECT `guid`, `deleted_name`, `deleted_account`, `deleted_time`, `identity_generation` FROM `characters` WHERE `deleted_time` IS NOT NULL AND `deleted_account` = %u LIMIT 0,50", uint32(atoi(searchString.c_str())));
             // search by account name
             else
             {
@@ -1408,12 +1488,12 @@ bool ChatHandler::GetDeletedCharacterInfoList(DeletedInfoList& foundList, bool u
                 std::copy(list.begin(), list.end(), std::ostream_iterator<int>(accountStream, ","));
                 std::string accounts = accountStream.str();
                 accounts.pop_back();
-                resultChar = CharacterDatabase.PQuery("SELECT `guid`, `deleted_name`, `deleted_account`, `deleted_time` FROM `characters` WHERE `deleted_time` IS NOT NULL AND `deleted_account` IN (%s) LIMIT 0,50", accounts.c_str());
+                resultChar = CharacterDatabase.PQuery("SELECT `guid`, `deleted_name`, `deleted_account`, `deleted_time`, `identity_generation` FROM `characters` WHERE `deleted_time` IS NOT NULL AND `deleted_account` IN (%s) LIMIT 0,50", accounts.c_str());
             }
         }
     }
     else
-        resultChar = CharacterDatabase.Query("SELECT `guid`, `deleted_name`, `deleted_account`, `deleted_time` FROM `characters` WHERE `deleted_time` IS NOT NULL LIMIT 0,50");
+        resultChar = CharacterDatabase.Query("SELECT `guid`, `deleted_name`, `deleted_account`, `deleted_time`, `identity_generation` FROM `characters` WHERE `deleted_time` IS NOT NULL LIMIT 0,50");
 
     if (resultChar)
     {
@@ -1425,12 +1505,16 @@ bool ChatHandler::GetDeletedCharacterInfoList(DeletedInfoList& foundList, bool u
 
             info.lowguid    = fields[0].GetUInt32();
             info.name       = fields[1].GetCppString();
+            info.originalName = info.name;
             info.accountId  = fields[2].GetUInt32();
+            info.originalAccountId = info.accountId;
+            info.originalDeletedTime = fields[3].GetUInt64();
+            info.originalGeneration = fields[4].GetUInt64();
 
             // account name will be empty for nonexistent account
             sAccountMgr.GetName (info.accountId, info.accountName);
 
-            info.deleteDate = time_t(fields[3].GetUInt64());
+            info.deleteDate = time_t(info.originalDeletedTime);
 
             foundList.push_back(info);
         } while (resultChar->NextRow());
@@ -1525,8 +1609,19 @@ bool ChatHandler::HandleCharacterDeletedListAccountCommand(char * args)
 }
 bool ChatHandler::HandleCharacterDeletedListCommand(char* args, bool useName)
 {
+    std::string searchString;
+    if (useName && *args)
+    {
+        char* target = ExtractQuotedOrLiteralArg(&args);
+        if (!target || *args)
+            return false;
+        searchString = target;
+    }
+    else
+        searchString = args;
+
     DeletedInfoList foundList;
-    if (!GetDeletedCharacterInfoList(foundList, useName, args))
+    if (!GetDeletedCharacterInfoList(foundList, useName, searchString))
         return false;
 
     // if no characters have been found, output a warning
@@ -1550,32 +1645,118 @@ bool ChatHandler::HandleCharacterDeletedListCommand(char* args, bool useName)
  *
  * @param delInfo the informations about the character which will be restored
  */
-void ChatHandler::HandleCharacterDeletedRestoreHelper(DeletedInfo const& delInfo)
+bool ChatHandler::HandleCharacterDeletedRestoreHelper(DeletedInfo const& delInfo, AccountLifecycleLease const* lease)
 {
+    AccountLifecycleLeasePtr ownedLease;
+    if (!lease)
+    {
+        ownedLease = GetAccountLifecycleRegistry().TryAcquire(
+            {delInfo.originalAccountId, delInfo.accountId},
+            AccountLifecycleKind::Mutation);
+        lease = ownedLease.get();
+    }
+    if (!lease || !lease->IsActive() ||
+        !GetAccountLifecycleRegistry().Allows(
+            *lease, delInfo.originalAccountId, AccountLifecycleKind::Mutation) ||
+        !GetAccountLifecycleRegistry().Allows(
+            *lease, delInfo.accountId, AccountLifecycleKind::Mutation))
+    {
+        PSendSysMessage(LANG_CHARACTER_DELETED_SKIP_ACCOUNT, delInfo.name.c_str(), delInfo.lowguid, delInfo.accountId);
+        return false;
+    }
+
     if (delInfo.accountName.empty())                    // account not exist
     {
         PSendSysMessage(LANG_CHARACTER_DELETED_SKIP_ACCOUNT, delInfo.name.c_str(), delInfo.lowguid, delInfo.accountId);
-        return;
+        return false;
     }
 
     // check character count
-    uint32 charcount = sAccountMgr.GetCharactersCount(delInfo.accountId);
+    uint32 charcount = 0;
+    if (!sAccountMgr.TryGetCharactersCount(delInfo.accountId, charcount))
+    {
+        PSendSysMessage(LANG_CHARACTER_DELETED_SKIP_ACCOUNT, delInfo.name.c_str(), delInfo.lowguid, delInfo.accountId);
+        return false;
+    }
     if (charcount >= 10)
     {
         PSendSysMessage(LANG_CHARACTER_DELETED_SKIP_FULL, delInfo.name.c_str(), delInfo.lowguid, delInfo.accountId);
-        return;
+        return false;
+    }
+
+    if (!isCanonicalFullPlayerName(delInfo.name))
+    {
+        PSendSysMessage(LANG_CHARACTER_DELETED_SKIP_NAME, delInfo.name.c_str(), delInfo.lowguid, delInfo.accountId);
+        return false;
     }
 
     if (sObjectMgr.GetPlayerGuidByName(delInfo.name))
     {
         PSendSysMessage(LANG_CHARACTER_DELETED_SKIP_NAME, delInfo.name.c_str(), delInfo.lowguid, delInfo.accountId);
-        return;
+        return false;
     }
 
-    // use blocking query as we need to reload character into cache
-    CharacterDatabase.DirectPExecute("UPDATE `characters` SET `name`='%s', `account`='%u', `deleted_time`=NULL, `deleted_name`=NULL, `deleted_account`=NULL WHERE `deleted_time` IS NOT NULL AND `guid` = %u",
-        delInfo.name.c_str(), delInfo.accountId, delInfo.lowguid);
-    sObjectMgr.LoadPlayerCacheData(delInfo.lowguid);
+    CharacterRestoration request;
+    request.guid = delInfo.lowguid;
+    request.expectedGeneration = delInfo.originalGeneration;
+    request.deletedName = delInfo.originalName;
+    request.deletedAccountId = delInfo.originalAccountId;
+    request.deletedTime = delInfo.originalDeletedTime;
+    request.targetCanonicalName = delInfo.name;
+    request.targetAccountId = delInfo.accountId;
+
+    CharacterPersistenceContext context(CharacterDatabase, delInfo.lowguid);
+    if (!AppendCharacterRestoration(CharacterDatabase, context, request))
+    {
+        PSendSysMessage(LANG_CHARACTER_DELETED_SKIP_NAME, delInfo.name.c_str(),
+                        delInfo.lowguid, delInfo.accountId);
+        return false;
+    }
+
+    SqlBatchResult const batch = context.Execute();
+    CharacterNameWriteStatus const status =
+        ClassifyCharacterNameClaim(batch, 1);
+    if (status == CharacterNameWriteStatus::OutcomeUnknown)
+    {
+        BlockCharacterRecovery(CharacterRecoveryRecord{
+            CharacterRecoveryKind::Restoration, {delInfo.lowguid},
+            {delInfo.originalAccountId, delInfo.accountId},
+            delInfo.originalGeneration, "character restoration outcome unknown"});
+        sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                 "Character restoration outcome unknown for guid %u (stage %u, stmt %zu)",
+                 delInfo.lowguid, uint32(batch.stage), batch.statementIndex);
+    }
+    if (status != CharacterNameWriteStatus::Committed)
+    {
+        PSendSysMessage(LANG_CHARACTER_DELETED_SKIP_NAME, delInfo.name.c_str(),
+                        delInfo.lowguid, delInfo.accountId);
+        return false;
+    }
+
+    if (!sWorld.UpdateRealmCharCount(delInfo.accountId, lease))
+    {
+        BlockCharacterRecovery(CharacterRecoveryRecord{
+            CharacterRecoveryKind::Restoration, {delInfo.lowguid},
+            {delInfo.originalAccountId, delInfo.accountId},
+            delInfo.originalGeneration,
+            "character restored but realm count publication failed"});
+        PSendSysMessage(LANG_CHARACTER_DELETED_SKIP_NAME, delInfo.name.c_str(),
+                        delInfo.lowguid, delInfo.accountId);
+        return false;
+    }
+    if (!sObjectMgr.LoadPlayerCacheData(delInfo.lowguid))
+    {
+        BlockCharacterRecovery(CharacterRecoveryRecord{
+            CharacterRecoveryKind::Restoration, {delInfo.lowguid},
+            {delInfo.originalAccountId, delInfo.accountId},
+            delInfo.originalGeneration,
+            "character restored but cache publication failed"});
+        sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                 "Character restoration committed but cache publication failed for guid %u",
+                 delInfo.lowguid);
+        return false;
+    }
+    return true;
 }
 
 /**
@@ -1599,9 +1780,56 @@ bool ChatHandler::HandleCharacterDeletedRestoreCommand(char* args)
     std::string newCharName;
     uint32 newAccount = 0;
 
-    // GCC by some strange reason fail build code without temporary variable
-    std::istringstream params(args);
-    params >> searchString >> newCharName >> newAccount;
+    char* searchArg = ExtractQuotedOrLiteralArg(&args);
+    if (!searchArg || !*searchArg)
+        return false;
+    searchString = searchArg;
+
+    static char const* profileOption = "--name-profile";
+    if (*args && strncmp(args, profileOption, strlen(profileOption)) != 0)
+    {
+        if (char* nameArg = ExtractQuotedOrLiteralArg(&args))
+            newCharName = nameArg;
+    }
+
+    uint8 profileRegion = 0;
+    std::size_t profileLocale = 0;
+    bool profileSupplied = false;
+
+    if (*args && strncmp(args, profileOption, strlen(profileOption)) != 0)
+    {
+        int32 account = 0;
+        if (!ExtractOptInt32(&args, account, 0) || account < 0)
+            return false;
+        newAccount = static_cast<uint32>(account);
+    }
+
+    if (*args)
+    {
+        char* option = ExtractLiteralArg(&args);
+        if (!option || strcmp(option, profileOption) != 0)
+            return false;
+        char* spec = ExtractLiteralArg(&args);
+        if (!spec || *args || !ParseNameProfile(spec, profileRegion, profileLocale))
+            return false;
+        profileSupplied = true;
+    }
+
+    if (!profileSupplied)
+    {
+        WorldSession* session = GetSession();
+        if (!session)
+            return false;
+        profileRegion = session->GetClientRegion();
+        profileLocale = static_cast<std::size_t>(session->GetClientLocale());
+    }
+    PlayerNameCharsets const charsets =
+        PlayerNameCharsets::ForClient(profileRegion, profileLocale);
+
+    if (!newCharName.empty() &&
+        prepareFullPlayerName(newCharName, GetPlayerNameLists(), charsets) !=
+            CHAR_NAME_SUCCESS)
+        return false;
 
     DeletedInfoList foundList;
     if (!GetDeletedCharacterInfoList(foundList, true, searchString))
@@ -1613,20 +1841,23 @@ bool ChatHandler::HandleCharacterDeletedRestoreCommand(char* args)
         return false;
     }
 
-    SendSysMessage(LANG_CHARACTER_DELETED_RESTORE);
-    HandleCharacterDeletedListHelper(foundList);
+    if (foundList.size() != 1)
+    {
+        SendSysMessage(LANG_CHARACTER_DELETED_ERR_RENAME);
+        return false;
+    }
 
+    DeletedInfo delInfo = foundList.front();
     if (newCharName.empty())
     {
-        // Drop nonexistent account cases
-        for (const auto& itr : foundList)
-            HandleCharacterDeletedRestoreHelper(itr);
+        std::string canonical = delInfo.name;
+        if (prepareFullPlayerName(canonical, GetPlayerNameLists(), charsets) !=
+            CHAR_NAME_SUCCESS)
+            return false;
+        delInfo.name = canonical;
     }
-    else if (foundList.size() == 1 && normalizePlayerName(newCharName))
+    else
     {
-        DeletedInfo delInfo = foundList.front();
-
-        // update name
         delInfo.name = newCharName;
 
         // if new account provided update deleted info
@@ -1635,12 +1866,13 @@ bool ChatHandler::HandleCharacterDeletedRestoreCommand(char* args)
             delInfo.accountId = newAccount;
             sAccountMgr.GetName (newAccount, delInfo.accountName);
         }
-
-        HandleCharacterDeletedRestoreHelper(delInfo);
     }
-    else
-        SendSysMessage(LANG_CHARACTER_DELETED_ERR_RENAME);
 
+    if (!HandleCharacterDeletedRestoreHelper(delInfo))
+        return false;
+
+    SendSysMessage(LANG_CHARACTER_DELETED_RESTORE);
+    HandleCharacterDeletedListHelper(foundList);
     return true;
 }
 
@@ -1656,12 +1888,16 @@ bool ChatHandler::HandleCharacterDeletedRestoreCommand(char* args)
  */
 bool ChatHandler::HandleCharacterDeletedDeleteCommand(char* args)
 {
-    // It is required to submit at least one argument
+    // It is required to submit exactly one target
     if (!*args)
         return false;
 
+    char* target = ExtractQuotedOrLiteralArg(&args);
+    if (!target || !*target || *args)
+        return false;
+
     DeletedInfoList foundList;
-    if (!GetDeletedCharacterInfoList(foundList, args))
+    if (!GetDeletedCharacterInfoList(foundList, true, target))
         return false;
 
     if (foundList.empty())
@@ -1670,13 +1906,26 @@ bool ChatHandler::HandleCharacterDeletedDeleteCommand(char* args)
         return false;
     }
 
-    SendSysMessage(LANG_CHARACTER_DELETED_DELETE);
+    if (foundList.size() != 1)
+    {
+        SendSysMessage(LANG_CHARACTER_DELETED_ERR_RENAME);
+        return false;
+    }
+
     HandleCharacterDeletedListHelper(foundList);
 
-    // Call the appropriate function to delete them (current account for deleted characters is 0)
-    for(const auto & itr : foundList)
-        Player::DeleteFromDB(ObjectGuid(HIGHGUID_PLAYER, itr.lowguid), 0, false, true);
-
+    DeletedInfo const& selected = foundList.front();
+    CharacterDeletionSnapshot snapshot;
+    snapshot.identity.guid = selected.lowguid;
+    snapshot.identity.accountId = selected.originalAccountId;
+    snapshot.identity.canonicalName = selected.originalName;
+    snapshot.identity.generation = selected.originalGeneration;
+    snapshot.deletedTime = selected.originalDeletedTime;
+    if (!Player::DeleteFromDB(
+            ObjectGuid(HIGHGUID_PLAYER, selected.lowguid),
+            snapshot.identity.accountId, false, true, &snapshot))
+        return false;
+    SendSysMessage(LANG_CHARACTER_DELETED_DELETE);
     return true;
 }
 
@@ -1730,7 +1979,11 @@ bool ChatHandler::HandleCharacterEraseCommand(char* args)
     std::string account_name;
     sAccountMgr.GetName (account_id,account_name);
 
-    Player::DeleteFromDB(target_guid, account_id, true, true);
+    if (!Player::DeleteFromDB(target_guid, account_id, true, true))
+    {
+        SetSentErrorMessage(true);
+        return false;
+    }
     PSendSysMessage(LANG_CHARACTER_DELETED, target_name.c_str(), target_guid.GetCounter(), account_name.c_str(), account_id);
     return true;
 }
@@ -1738,7 +1991,7 @@ bool ChatHandler::HandleCharacterEraseCommand(char* args)
 
 bool ChatHandler::HandleCleanCharactersToDeleteCommand(char* args)
 {
-    std::unique_ptr<QueryResult> toDeleteCharsResult = CharacterDatabase.Query("SELECT `guid` FROM `characters_guid_delete`;");
+    std::unique_ptr<QueryResult> toDeleteCharsResult = CharacterDatabase.Query("SELECT c.`guid`, c.`account`, c.`name`, c.`identity_generation`, IFNULL(c.`deleted_time`,0), c.`deleted_account`, c.`deleted_name` FROM `characters_guid_delete` d JOIN `characters` c ON c.`guid`=d.`guid`;");
     if (!toDeleteCharsResult)
     {
         SendSysMessage("Table 'characters_guid_delete' is empty or does not exist.");
@@ -1748,22 +2001,42 @@ bool ChatHandler::HandleCleanCharactersToDeleteCommand(char* args)
     else
     {
         uint32 deleteCount = 0;
+        uint32 failureCount = 0;
         Field* fields;
+        if (toDeleteCharsResult->GetRowCount() > 0)
         do
         {
             fields = toDeleteCharsResult->Fetch();
-            uint32 guid  = fields[0].GetUInt32();
+            if (!fields)
+                break;
+            uint32 guid = fields[0].GetUInt32();
+            CharacterDeletionSnapshot snapshot;
+            snapshot.identity.guid = guid;
+            snapshot.deletedTime = fields[4].GetUInt64();
+            snapshot.identity.generation = fields[3].GetUInt64();
+            if (snapshot.deletedTime == 0)
+            {
+                snapshot.identity.accountId = fields[1].GetUInt32();
+                snapshot.identity.canonicalName = fields[2].GetCppString();
+            }
+            else
+            {
+                snapshot.identity.accountId = fields[5].GetUInt32();
+                snapshot.identity.canonicalName = fields[6].GetCppString();
+            }
 
-            Player::DeleteFromDB(guid,
-                                 0, // AccountID
-                                 false, // Update realm characters count
-                                 true // Delete finally
-                                );
-
-            ++deleteCount;
+            if (Player::DeleteFromDB(
+                    ObjectGuid(HIGHGUID_PLAYER, guid),
+                    snapshot.identity.accountId, false, true, &snapshot))
+                ++deleteCount;
+            else
+                ++failureCount;
         }
         while (toDeleteCharsResult->NextRow());
-        PSendSysMessage("%u characters have been deleted.", deleteCount);
+        PSendSysMessage("%u characters have been deleted; %u failed.",
+                        deleteCount, failureCount);
+        if (failureCount != 0)
+            SetSentErrorMessage(true);
     }
     return true;
 }
@@ -4905,53 +5178,50 @@ bool ChatHandler::HandlePDumpLoadCommand(char *args)
     if (!account_id)
         return false;
 
-    char* name_str = ExtractLiteralArg(&args);
-
-    uint32 lowguid = 0;
     std::string name;
-
-    if (name_str)
+    uint32 lowguid = 0;
+    if (*args && !IsExactOptionToken(args, "--name-profile"))
     {
-        name = name_str;
-        // normalize the name if specified and check if it exists
-        if (!normalizePlayerName(name))
-        {
-            PSendSysMessage(LANG_INVALID_CHARACTER_NAME);
-            SetSentErrorMessage(true);
+        char* name_arg = ExtractQuotedOrLiteralArg(&args);
+        if (!name_arg || !*name_arg || std::strncmp(name_arg, "--", 2) == 0)
             return false;
-        }
-
-        if (ObjectMgr::CheckPlayerName(name, true) != CHAR_NAME_SUCCESS)
+        name = name_arg;
+        if (*args && !IsExactOptionToken(args, "--name-profile"))
         {
-            PSendSysMessage(LANG_INVALID_CHARACTER_NAME);
-            SetSentErrorMessage(true);
-            return false;
-        }
-
-        if (*args)
-        {
-            if (!ExtractUInt32(&args, lowguid))
-                return false;
-
-            if (!lowguid)
+            if (!ExtractUInt32(&args, lowguid) || !lowguid)
             {
                 PSendSysMessage(LANG_INVALID_CHARACTER_GUID);
-                SetSentErrorMessage(true);
-                return false;
-            }
-
-            ObjectGuid guid = ObjectGuid(HIGHGUID_PLAYER, lowguid);
-
-            if (sObjectMgr.GetPlayerAccountIdByGUID(guid))
-            {
-                PSendSysMessage(LANG_CHARACTER_GUID_IN_USE, lowguid);
                 SetSentErrorMessage(true);
                 return false;
             }
         }
     }
 
-    switch (PlayerDumpReader().LoadDump(file, account_id, name, lowguid))
+    uint8 profileRegion = 0;
+    std::size_t profileLocale = 0;
+    bool profileSupplied = false;
+    if (*args)
+    {
+        if (!ExtractLiteralArg(&args, "--name-profile"))
+            return false;
+        char* spec = ExtractLiteralArg(&args);
+        if (!spec || !*spec || *args ||
+            !ParseNameProfile(spec, profileRegion, profileLocale))
+            return false;
+        profileSupplied = true;
+    }
+    if (!profileSupplied)
+    {
+        WorldSession* session = GetSession();
+        if (!session)
+            return false;
+        profileRegion = session->GetClientRegion();
+        profileLocale = static_cast<std::size_t>(session->GetClientLocale());
+    }
+
+    PlayerDumpNamePolicy policy{profileRegion, profileLocale,
+        !GetSession() || GetSession()->GetSecurity() >= SEC_ADMINISTRATOR};
+    switch (PlayerDumpReader().LoadDump(file, account_id, name, lowguid, policy))
     {
         case DUMP_SUCCESS:
             PSendSysMessage(LANG_COMMAND_IMPORT_SUCCESS);
@@ -4973,10 +5243,8 @@ bool ChatHandler::HandlePDumpLoadCommand(char *args)
             SetSentErrorMessage(true);
             return false;
     }
-
     return true;
 }
-
 bool ChatHandler::HandlePDumpWriteCommand(char *args)
 {
     if (!*args)
@@ -5556,22 +5824,30 @@ bool ChatHandler::HandleServiceDeleteCharacters(char* args)
 
     std::unique_ptr<QueryResult> result = CharacterDatabase.Query(s.str().c_str());
     uint32 count = 0;
-    if (result)
+    uint32 failures = 0;
+    if (result && result->GetRowCount() > 0)
     {
-        count = result->GetRowCount();
         do
         {
             Field* fields = result->Fetch();
+            if (!fields)
+                break;
             uint32 lowGuid = fields[0].GetUInt32();
             uint32 accountId = fields[1].GetUInt32();
 
             ObjectGuid guid = ObjectGuid(HIGHGUID_PLAYER, lowGuid);
 
-            Player::DeleteFromDB(guid, accountId, true, true);
+            if (Player::DeleteFromDB(guid, accountId, true, true))
+                ++count;
+            else
+                ++failures;
         } while (result->NextRow());
     }
 
-    sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "Service: Removed %u characters", count);
+    sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL,
+             "Service: Removed %u characters; %u failed", count, failures);
+    if (failures != 0)
+        SetSentErrorMessage(true);
     return true;
 }
 

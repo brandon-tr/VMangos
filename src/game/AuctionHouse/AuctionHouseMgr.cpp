@@ -21,6 +21,11 @@
 
 #include "AuctionHouseMgr.h"
 #include "Database/DatabaseEnv.h"
+#include "Database/CharacterPersistenceContext.h"
+#include "Database/CharacterIdentityPersistence.h"
+#include "Database/CharacterPersistenceRecovery.h"
+#include "Database/SqlPreparedStatement.h"
+#include "Mail/MailPersistence.h"
 #include "DBCStores.h"
 #include "AccountMgr.h"
 #include "Item.h"
@@ -109,175 +114,436 @@ uint32 AuctionHouseMgr::GetAuctionDeposit(AuctionHouseEntry const* entry, uint32
     return uint32(deposit * sWorld.getConfig(CONFIG_FLOAT_RATE_AUCTION_DEPOSIT));
 }
 
-// does not clear ram
-void AuctionHouseMgr::SendAuctionWonMail(AuctionEntry* auction)
+namespace
 {
-    Item *pItem = GetAItem(auction->itemGuidLow);
-    if (!pItem)
+void AddAuctionAccount(std::vector<uint32>& accounts, uint32 guid)
+{
+    if (!guid)
         return;
+    uint32 const account = sObjectMgr.GetPlayerAccountIdByGUID(
+        ObjectGuid(HIGHGUID_PLAYER, guid));
+    if (account)
+        accounts.push_back(account);
+}
 
-    ObjectGuid bidder_guid = ObjectGuid(HIGHGUID_PLAYER, auction->bidder);
-    Player* bidder = sObjectMgr.GetPlayer(bidder_guid);
+CharacterIdentitySnapshot BuildAuctionIdentity(Player const& player)
+{
+    CharacterIdentitySnapshot identity;
+    identity.guid = player.GetGUIDLow();
+    identity.accountId = player.GetSession()
+        ? player.GetSession()->GetAccountId() : 0;
+    identity.canonicalName = player.GetName();
+    identity.generation = player.GetIdentityGeneration();
+    return identity;
+}
 
-    uint32 bidder_accId = 0;
+void BlockAuctionRecovery(std::vector<uint32> guids,
+                          std::vector<uint32> accounts,
+                          char const* detail)
+{
+    CharacterRecoveryRecord record;
+    record.kind = CharacterRecoveryKind::WholeSave;
+    record.guids = std::move(guids);
+    record.accountIds = std::move(accounts);
+    record.expectedGeneration = 0;
+    record.detail = detail;
+    if (!record.guids.empty() || !record.accountIds.empty())
+        BlockCharacterRecovery(record);
+}
+}
 
-    // data for gm.log
-    if (sWorld.getConfig(CONFIG_BOOL_GM_LOG_TRADE))
-    {
-        uint32 bidder_security = 0;
-        std::string bidder_name;
-        if (bidder)
-        {
-            bidder_accId = bidder->GetSession()->GetAccountId();
-            bidder_security = bidder->GetSession()->GetSecurity();
-            bidder_name = bidder->GetName();
-        }
-        else
-        {
-            bidder_accId = sObjectMgr.GetPlayerAccountIdByGUID(bidder_guid);
-            bidder_security = sAccountMgr.GetSecurity(bidder_accId);
+bool AuctionHouseMgr::AppendAuctionWonMail(
+    CharacterPersistenceContext& context, AuctionEntry* auction,
+    uint32 bidderGuid, uint32 bidAmount)
+{
+    Item* pItem = GetAItem(auction->itemGuidLow);
+    if (!pItem)
+        return false;
 
-            if (bidder_security > SEC_PLAYER)               // not do redundant DB requests
-            {
-                if (!sObjectMgr.GetPlayerNameByGUID(bidder_guid, bidder_name))
-                    bidder_name = sObjectMgr.GetMangosStringForDBCLocale(LANG_UNKNOWN);
-            }
-        }
+    ObjectGuid const bidderGuidObj(HIGHGUID_PLAYER, bidderGuid);
+    Player* bidder = sObjectMgr.GetPlayer(bidderGuidObj);
+    uint32 const bidderAccount = bidder && bidder->GetSession()
+        ? bidder->GetSession()->GetAccountId()
+        : sObjectMgr.GetPlayerAccountIdByGUID(bidderGuidObj);
+    if (!bidder && !bidderAccount)
+        return false;
 
-        if (bidder_security > SEC_PLAYER)
-        {
-            ObjectGuid owner_guid = ObjectGuid(HIGHGUID_PLAYER, auction->owner);
-            std::string owner_name;
-            if (!sObjectMgr.GetPlayerNameByGUID(owner_guid, owner_name))
-                owner_name = sObjectMgr.GetMangosStringForDBCLocale(LANG_UNKNOWN);
+    std::ostringstream subject;
+    subject << auction->itemTemplate << ":0:" << AUCTION_WON;
+    std::ostringstream body;
+    body.width(16);
+    body << std::right << std::hex << auction->owner;
+    body << std::dec << ":" << bidAmount << ":" << auction->buyout;
 
-            uint32 owner_accid = sObjectMgr.GetPlayerAccountIdByGUID(owner_guid);
+    uint32 mailId = 0;
+    if (!MailDraft(subject.str(), body.str())
+             .AddItem(pItem)
+             .AppendSendTo(context, MailReceiver(bidder, bidderGuidObj),
+                           auction, MAIL_CHECK_MASK_COPIED, 0, 0, mailId))
+        return false;
 
-            sLog.Player(bidder_accId, LOG_GM, LOG_LVL_BASIC, 
-                "GM %s (Account: %u) won item in auction: %s (Entry: %u Count: %u) and pay money: %u. Original owner %s (Account: %u)",
-                bidder_name.c_str(), bidder_accId, pItem->GetProto()->Name1, pItem->GetEntry(), pItem->GetCount(), auction->bid, owner_name.c_str(), owner_accid);
-        }
-    }
-    else if (!bidder)
-        bidder_accId = sObjectMgr.GetPlayerAccountIdByGUID(bidder_guid);
-
-    // receiver exist
-    if (bidder || bidder_accId)
-    {
-        std::ostringstream msgAuctionWonSubject;
-        msgAuctionWonSubject << auction->itemTemplate << ":0:" << AUCTION_WON;
-
-        std::ostringstream msgAuctionWonBody;
-        msgAuctionWonBody.width(16);
-        msgAuctionWonBody << std::right << std::hex << auction->owner;
-        msgAuctionWonBody << std::dec << ":" << auction->bid << ":" << auction->buyout;
-        sLog.Out(LOG_BASIC, LOG_LVL_DEBUG, "AuctionWon body string : %s", msgAuctionWonBody.str().c_str());
-
-        // set owner to bidder (to prevent delete item with sender char deleting)
-        // owner in `data` will set at mail receive and item extracting
-        CharacterDatabase.PExecute("UPDATE `item_instance` SET `owner_guid` = '%u' WHERE `guid`='%u'", auction->bidder, pItem->GetGUIDLow());
-        CharacterDatabase.CommitTransaction();
-
+    context.OnCommit([bidder, auction]() {
         if (bidder)
             bidder->GetSession()->SendAuctionBidderNotification(auction, true);
-        else
-            RemoveAItem(pItem->GetGUIDLow());               // we have to remove the item, before we delete it !!
-
-        // will delete item or place to receiver mail list
-        MailDraft(msgAuctionWonSubject.str(), msgAuctionWonBody.str())
-        .AddItem(pItem)
-        .SendMailTo(MailReceiver(bidder, bidder_guid), auction, MAIL_CHECK_MASK_COPIED);
-    }
-    // receiver not exist
-    else
-    {
-        CharacterDatabase.PExecute("DELETE FROM `item_instance` WHERE `guid`='%u'", pItem->GetGUIDLow());
-        RemoveAItem(pItem->GetGUIDLow());                   // we have to remove the item, before we delete it !!
-        delete pItem;
-    }
+    });
+    return true;
 }
 
-// call this method to send mail to auction owner, when auction is successful, it does not clear ram
-void AuctionHouseMgr::SendAuctionSuccessfulMail(AuctionEntry* auction)
+bool AuctionHouseMgr::AppendAuctionSuccessfulMail(
+    CharacterPersistenceContext& context, AuctionEntry* auction,
+    uint32 bidderGuid, uint32 bidAmount)
 {
-    ObjectGuid owner_guid = ObjectGuid(HIGHGUID_PLAYER, auction->owner);
-    Player* owner = sObjectMgr.GetPlayer(owner_guid);
+    ObjectGuid const ownerGuid(HIGHGUID_PLAYER, auction->owner);
+    Player* owner = sObjectMgr.GetPlayer(ownerGuid);
+    uint32 const ownerAccount = owner && owner->GetSession()
+        ? owner->GetSession()->GetAccountId()
+        : sObjectMgr.GetPlayerAccountIdByGUID(ownerGuid);
+    if (!owner && !ownerAccount)
+        return false;
 
-    uint32 owner_accId = 0;
-    if (!owner)
-        owner_accId = sObjectMgr.GetPlayerAccountIdByGUID(owner_guid);
+    uint32 const auctionCut = auction->GetAuctionCut();
+    uint32 const profit = bidAmount + auction->deposit - auctionCut;
 
-    // owner exist
-    if (owner || owner_accId)
-    {
-        std::ostringstream msgAuctionSuccessfulSubject;
-        msgAuctionSuccessfulSubject << auction->itemTemplate << ":0:" << AUCTION_SUCCESSFUL;
+    std::ostringstream subject;
+    subject << auction->itemTemplate << ":0:" << AUCTION_SUCCESSFUL;
+    std::ostringstream body;
+    body.width(16);
+    body << std::right << std::hex << bidderGuid;
+    body << std::dec << ":" << bidAmount << ":" << auction->buyout;
+    body << ":" << auction->deposit << ":" << auctionCut;
 
-        std::ostringstream auctionSuccessfulBody;
-        uint32 auctionCut = auction->GetAuctionCut();
+    uint32 mailId = 0;
+    if (!MailDraft(subject.str(), body.str())
+             .SetMoney(profit)
+             .AppendSendTo(context, MailReceiver(owner, ownerGuid), auction,
+                           MAIL_CHECK_MASK_COPIED, 0, 0, mailId))
+        return false;
 
-        auctionSuccessfulBody.width(16);
-        auctionSuccessfulBody << std::right << std::hex << auction->bidder;
-        auctionSuccessfulBody << std::dec << ":" << auction->bid << ":" << auction->buyout;
-        auctionSuccessfulBody << ":" << auction->deposit << ":" << auctionCut;
-
-        sLog.Out(LOG_BASIC, LOG_LVL_DEBUG, "AuctionSuccessful body string : %s", auctionSuccessfulBody.str().c_str());
-
-        uint32 profit = auction->bid + auction->deposit - auctionCut;
-
+    context.OnCommit([owner, auction]() {
         if (owner)
-        {
-            //send auction owner notification, bidder must be current!
             owner->GetSession()->SendAuctionOwnerNotification(auction, true);
-        }
-
-        MailDraft(msgAuctionSuccessfulSubject.str(), auctionSuccessfulBody.str())
-        .SetMoney(profit)
-        .SendMailTo(MailReceiver(owner, owner_guid), auction, MAIL_CHECK_MASK_COPIED);
-    }
+    });
+    return true;
 }
 
-// does not clear ram
-void AuctionHouseMgr::SendAuctionExpiredMail(AuctionEntry* auction)
+bool AuctionHouseMgr::AppendAuctionExpiredMail(
+    CharacterPersistenceContext& context, AuctionEntry* auction)
 {
-    // return an item in auction to its owner by mail
-    Item *pItem = GetAItem(auction->itemGuidLow);
+    Item* pItem = GetAItem(auction->itemGuidLow);
     if (!pItem)
-    {
-        sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "Auction item (GUID: %u) not found, and lost.", auction->itemGuidLow);
-        return;
-    }
+        return false;
 
-    ObjectGuid owner_guid = ObjectGuid(HIGHGUID_PLAYER, auction->owner);
-    Player* owner = sObjectMgr.GetPlayer(owner_guid);
+    ObjectGuid const ownerGuid(HIGHGUID_PLAYER, auction->owner);
+    Player* owner = sObjectMgr.GetPlayer(ownerGuid);
+    uint32 const ownerAccount = owner && owner->GetSession()
+        ? owner->GetSession()->GetAccountId()
+        : sObjectMgr.GetPlayerAccountIdByGUID(ownerGuid);
+    if (!owner && !ownerAccount)
+        return false;
 
-    uint32 owner_accId = 0;
-    if (!owner)
-        owner_accId = sObjectMgr.GetPlayerAccountIdByGUID(owner_guid);
+    std::ostringstream subject;
+    subject << auction->itemTemplate << ":0:" << AUCTION_EXPIRED;
 
-    // owner exist
-    if (owner || owner_accId)
-    {
-        std::ostringstream subject;
-        subject << auction->itemTemplate << ":0:" << AUCTION_EXPIRED;
+    uint32 mailId = 0;
+    if (!MailDraft(subject.str())
+             .AddItem(pItem)
+             .AppendSendTo(context, MailReceiver(owner, ownerGuid), auction,
+                           MAIL_CHECK_MASK_COPIED, 0, 0, mailId))
+        return false;
 
+    context.OnCommit([owner, auction]() {
         if (owner)
             owner->GetSession()->SendAuctionOwnerNotification(auction, false);
-        else
-            RemoveAItem(pItem->GetGUIDLow());               // we have to remove the item, before we delete it !!
+    });
+    return true;
+}
 
-        // will delete item or place to receiver mail list
-        MailDraft(subject.str())
+bool AuctionHouseMgr::AppendAuctionOutbiddedMail(
+    CharacterPersistenceContext& context, AuctionEntry* auction,
+    uint32 oldBidderGuid, uint32 oldBid)
+{
+    if (!oldBidderGuid)
+        return true;
+
+    ObjectGuid const bidderGuid(HIGHGUID_PLAYER, oldBidderGuid);
+    Player* bidder = sObjectMgr.GetPlayer(bidderGuid);
+    uint32 const bidderAccount = bidder && bidder->GetSession()
+        ? bidder->GetSession()->GetAccountId()
+        : sObjectMgr.GetPlayerAccountIdByGUID(bidderGuid);
+    if (!bidder && !bidderAccount)
+        return false;                                   // cannot refund
+
+    std::ostringstream subject;
+    subject << auction->itemTemplate << ":0:" << AUCTION_OUTBIDDED;
+    uint32 mailId = 0;
+    if (!MailDraft(subject.str())
+             .SetMoney(oldBid)
+             .AppendSendTo(context, MailReceiver(bidder, bidderGuid), auction,
+                           MAIL_CHECK_MASK_COPIED, 0, 0, mailId))
+        return false;
+
+    context.OnCommit([bidder, auction]() {
+        if (bidder)
+            bidder->GetSession()->SendAuctionBidderNotification(auction, false);
+    });
+    return true;
+}
+
+bool AuctionHouseMgr::AppendAuctionCancelledToBidderMail(
+    CharacterPersistenceContext& context, AuctionEntry* auction,
+    uint32 bidderGuid, uint32 bidAmount)
+{
+    if (!bidderGuid)
+        return true;
+
+    ObjectGuid const bidderGuidObj(HIGHGUID_PLAYER, bidderGuid);
+    Player* bidder = sObjectMgr.GetPlayer(bidderGuidObj);
+    uint32 const bidderAccount = bidder && bidder->GetSession()
+        ? bidder->GetSession()->GetAccountId()
+        : sObjectMgr.GetPlayerAccountIdByGUID(bidderGuidObj);
+    if (!bidder && !bidderAccount)
+        return false;
+
+    std::ostringstream subject;
+    subject << auction->itemTemplate << ":0:" << AUCTION_CANCELLED_TO_BIDDER;
+    uint32 mailId = 0;
+    if (!MailDraft(subject.str())
+             .SetMoney(bidAmount)
+             .AppendSendTo(context, MailReceiver(bidder, bidderGuidObj),
+                           auction, MAIL_CHECK_MASK_COPIED, 0, 0, mailId))
+        return false;
+
+    context.OnCommit([bidder, auction]() {
+        if (bidder)
+            bidder->GetSession()->SendAuctionRemovedNotification(auction);
+    });
+    return true;
+}
+
+bool AuctionHouseMgr::AppendAuctionCancelledOwnerMail(
+    CharacterPersistenceContext& context, AuctionEntry* auction)
+{
+    Item* pItem = GetAItem(auction->itemGuidLow);
+    if (!pItem)
+        return false;
+
+    ObjectGuid const ownerGuid(HIGHGUID_PLAYER, auction->owner);
+    Player* owner = sObjectMgr.GetPlayer(ownerGuid);
+    uint32 const ownerAccount = owner && owner->GetSession()
+        ? owner->GetSession()->GetAccountId()
+        : sObjectMgr.GetPlayerAccountIdByGUID(ownerGuid);
+    if (!owner && !ownerAccount)
+        return false;
+
+    std::ostringstream subject;
+    subject << auction->itemTemplate << ":0:" << AUCTION_CANCELED;
+    uint32 mailId = 0;
+    return MailDraft(subject.str())
         .AddItem(pItem)
-        .SendMailTo(MailReceiver(owner, owner_guid), auction, MAIL_CHECK_MASK_COPIED);
-    }
-    // owner not found
+        .AppendSendTo(context, MailReceiver(owner, ownerGuid), auction,
+                      MAIL_CHECK_MASK_COPIED, 0, 0, mailId);
+}
+
+MailPersistenceStatus AuctionHouseMgr::ProcessExpiredAuction(
+    AuctionEntry* auction)
+{
+    Item* pItem = GetAItem(auction->itemGuidLow);
+    if (!pItem)
+        return MailPersistenceStatus::Rejected;
+
+    std::vector<uint32> accounts;
+    AddAuctionAccount(accounts, auction->owner);
+    if (auction->bidder)
+        AddAuctionAccount(accounts, auction->bidder);
+    if (accounts.empty())
+        return MailPersistenceStatus::Rejected;
+
+    CharacterPersistenceAdmission admission;
+    if (!admission.Admit(accounts, AccountLifecycleKind::Mutation))
+        return MailPersistenceStatus::Rejected;
+
+    CharacterPersistenceContext context(CharacterDatabase, auction->Id);
+    bool assembled;
+    if (auction->bidder == 0)
+        assembled = AppendAuctionExpiredMail(context, auction);
     else
+        assembled = AppendAuctionSuccessfulMail(context, auction,
+                                                auction->bidder, auction->bid) &&
+                    AppendAuctionWonMail(context, auction, auction->bidder,
+                                         auction->bid);
+    assembled = assembled && auction->AppendDeleteFromDB(context);
+    if (!assembled)
+        return MailPersistenceStatus::Rejected;
+
+    MailPersistenceStatus const status =
+        ClassifyMailBatch(context.Execute());
+    if (status == MailPersistenceStatus::Committed)
+        RemoveAItem(auction->itemGuidLow);
+    else if (status == MailPersistenceStatus::OutcomeUnknown)
     {
-        CharacterDatabase.PExecute("DELETE FROM `item_instance` WHERE `guid`='%u'", pItem->GetGUIDLow());
-        RemoveAItem(pItem->GetGUIDLow());                   // we have to remove the item, before we delete it !!
-        delete pItem;
+        auction->recoveryBlocked = true;
+        BlockAuctionRecovery({auction->owner, auction->bidder}, accounts,
+                             "expired auction outcome unknown");
     }
+    return status;
+}
+
+MailPersistenceStatus AuctionHouseMgr::ProcessBuyoutAuction(
+    AuctionEntry* auction, Player* buyer, int32 paid,
+    uint32 previousBidder, uint32 previousBid)
+{
+    if (!auction || !buyer || !buyer->GetSession() || paid < 0)
+        return MailPersistenceStatus::Rejected;
+    Item* pItem = GetAItem(auction->itemGuidLow);
+    if (!pItem)
+        return MailPersistenceStatus::Rejected;
+
+    CharacterIdentitySnapshot const identity = BuildAuctionIdentity(*buyer);
+    std::vector<uint32> accounts{identity.accountId};
+    AddAuctionAccount(accounts, auction->owner);
+    if (previousBidder && previousBidder != buyer->GetGUIDLow())
+        AddAuctionAccount(accounts, previousBidder);
+
+    CharacterPersistenceAdmission admission;
+    if (!admission.Admit(accounts, AccountLifecycleKind::Mutation))
+        return MailPersistenceStatus::Rejected;
+
+    CharacterPersistenceContext context(CharacterDatabase, identity.guid);
+    bool assembled =
+        context.AppendIdentityGuards({identity}) &&
+        buyer->AppendGoldProjectedToDB(
+            context, buyer->GetMoney() - uint32(paid));
+    if (assembled && previousBidder &&
+        previousBidder != buyer->GetGUIDLow())
+        assembled = AppendAuctionOutbiddedMail(context, auction,
+                                               previousBidder, previousBid);
+    assembled = assembled &&
+                AppendAuctionSuccessfulMail(context, auction,
+                                            buyer->GetGUIDLow(),
+                                            auction->buyout) &&
+                AppendAuctionWonMail(context, auction, buyer->GetGUIDLow(),
+                                     auction->buyout) &&
+                auction->AppendDeleteFromDB(context);
+    if (!assembled)
+        return MailPersistenceStatus::Rejected;
+
+    context.OnCommit([buyer, auction, paid]() {
+        buyer->LogModifyMoney(-paid, "AuctionBuyout",
+                              ObjectGuid(HIGHGUID_PLAYER, auction->owner),
+                              auction->itemTemplate);
+        auction->bidder = buyer->GetGUIDLow();
+        auction->bid = auction->buyout;
+    });
+    buyer->AppendIdentityGenerationPublication(context);
+
+    MailPersistenceStatus const status =
+        ClassifyMailBatch(context.Execute());
+    if (status == MailPersistenceStatus::Committed)
+        RemoveAItem(auction->itemGuidLow);
+    else if (status == MailPersistenceStatus::OutcomeUnknown)
+    {
+        auction->recoveryBlocked = true;
+        std::vector<uint32> guids{identity.guid, auction->owner};
+        if (previousBidder && previousBidder != identity.guid)
+            guids.push_back(previousBidder);
+        BlockAuctionRecovery(std::move(guids), accounts,
+                             "auction buyout outcome unknown");
+    }
+    return status;
+}
+
+MailPersistenceStatus AuctionHouseMgr::ProcessOrphanedAuction(
+    AuctionEntry* auction)
+{
+    if (!auction || !GetAItem(auction->itemGuidLow))
+        return MailPersistenceStatus::Rejected;
+
+    ObjectGuid const ownerGuid(HIGHGUID_PLAYER, auction->owner);
+    Player* owner = sObjectMgr.GetPlayer(ownerGuid);
+    uint32 const ownerAccount = owner && owner->GetSession()
+        ? owner->GetSession()->GetAccountId()
+        : sObjectMgr.GetPlayerAccountIdByGUID(ownerGuid);
+    if (!ownerAccount)
+        return MailPersistenceStatus::Rejected;
+
+    CharacterPersistenceAdmission admission;
+    if (!admission.Admit({ownerAccount}, AccountLifecycleKind::Mutation))
+        return MailPersistenceStatus::Rejected;
+
+    CharacterPersistenceContext context(CharacterDatabase, auction->Id);
+    std::ostringstream subject;
+    subject << auction->itemTemplate << ":0:" << AUCTION_CANCELED;
+    uint32 mailId = 0;
+    if (!MailDraft(subject.str())
+             .AddItem(GetAItem(auction->itemGuidLow))
+             .AppendSendTo(context, MailReceiver(owner, ownerGuid), auction,
+                           MAIL_CHECK_MASK_COPIED, 0, 0, mailId) ||
+        !auction->AppendDeleteFromDB(context))
+        return MailPersistenceStatus::Rejected;
+
+    MailPersistenceStatus const status = ClassifyMailBatch(context.Execute());
+    if (status == MailPersistenceStatus::Committed)
+        RemoveAItem(auction->itemGuidLow);
+    else if (status == MailPersistenceStatus::OutcomeUnknown)
+    {
+        auction->recoveryBlocked = true;
+        BlockAuctionRecovery({auction->owner}, {ownerAccount},
+                             "orphaned auction outcome unknown");
+    }
+    return status;
+}
+
+MailPersistenceStatus AuctionHouseMgr::ProcessCancelAuction(
+    AuctionEntry* auction, Player* owner, uint32 auctionCut)
+{
+    if (!auction || !owner || !owner->GetSession())
+        return MailPersistenceStatus::Rejected;
+    if (!GetAItem(auction->itemGuidLow))
+        return MailPersistenceStatus::Rejected;
+
+    CharacterIdentitySnapshot const identity = BuildAuctionIdentity(*owner);
+    std::vector<uint32> accounts{identity.accountId};
+    if (auction->bidder)
+        AddAuctionAccount(accounts, auction->bidder);
+
+    CharacterPersistenceAdmission admission;
+    if (!admission.Admit(accounts, AccountLifecycleKind::Mutation))
+        return MailPersistenceStatus::Rejected;
+
+    CharacterPersistenceContext context(CharacterDatabase, identity.guid);
+    bool assembled = context.AppendIdentityGuards({identity});
+    if (assembled && auction->bidder)
+    {
+        if (auctionCut > 0)
+            assembled = owner->AppendGoldProjectedToDB(
+                context, owner->GetMoney() - auctionCut);
+        assembled = assembled &&
+                    AppendAuctionCancelledToBidderMail(
+                        context, auction, auction->bidder, auction->bid);
+    }
+    assembled = assembled &&
+                AppendAuctionCancelledOwnerMail(context, auction) &&
+                auction->AppendDeleteFromDB(context);
+    if (!assembled)
+        return MailPersistenceStatus::Rejected;
+
+    context.OnCommit([owner, auction, auctionCut]() {
+        if (auction->bidder && auctionCut > 0)
+            owner->ModifyMoney(-int32(auctionCut));
+    });
+    owner->AppendIdentityGenerationPublication(context);
+
+    MailPersistenceStatus const status =
+        ClassifyMailBatch(context.Execute());
+    if (status == MailPersistenceStatus::Committed)
+        RemoveAItem(auction->itemGuidLow);
+    else if (status == MailPersistenceStatus::OutcomeUnknown)
+    {
+        auction->recoveryBlocked = true;
+        BlockAuctionRecovery({identity.guid, auction->bidder}, accounts,
+                             "auction cancel outcome unknown");
+    }
+    return status;
 }
 
 AuctionHouseObject* AuctionHouseMgr::MakeNewAuctionHouseObject()
@@ -346,7 +612,7 @@ void AuctionHouseMgr::LoadAuctionHouses()
 void AuctionHouseMgr::LoadAuctionItems()
 {
     //                                                                     0               1                    2        3           4          5        6               7                     8             9       10                           11
-    std::unique_ptr<QueryResult> result = CharacterDatabase.Query("SELECT `creator_guid`, `gift_creator_guid`, `count`, `duration`, `charges`, `flags`, `enchantments`, `random_property_id`, `durability`, `text`, `item_guid`, `item_instance`.`item_id` FROM `auction` JOIN `item_instance` ON `item_guid` = `guid`");
+    std::unique_ptr<QueryResult> result = CharacterDatabase.Query("SELECT `creator_guid`, `gift_creator_guid`, `count`, `duration`, `charges`, `flags`, `enchantments`, `random_property_id`, `durability`, `text`, `item_guid`, `item_instance`.`item_id`, `item_instance`.`owner_guid` FROM `auction` JOIN `item_instance` ON `item_guid` = `guid`");
 
     if (!result)
     {
@@ -380,7 +646,10 @@ void AuctionHouseMgr::LoadAuctionItems()
 
         Item *item = NewItemOrBag(proto);
 
-        if (!item->LoadFromDB(itemGuid, ObjectGuid(), fields, itemId))
+        // The persisted owner is the expected owner for the later transfer;
+        // auction Items must not load with an empty owner.
+        ObjectGuid const persistedOwner(HIGHGUID_PLAYER, fields[12].GetUInt32());
+        if (!item->LoadFromDB(itemGuid, persistedOwner, fields, itemId))
         {
             delete item;
             continue;
@@ -451,19 +720,15 @@ void AuctionHouseMgr::LoadAuctions()
             // need for send mail, use goblin auctionhouse
             auction->auctionHouseEntry = sAuctionHouseStore.LookupEntry(7);
 
-            // Attempt send item back to owner
-            std::ostringstream msgAuctionCanceledOwner;
-            msgAuctionCanceledOwner << auction->itemTemplate << ":0:" << AUCTION_CANCELED;
+            // Item return and auction deletion are one checked unit.
+            MailPersistenceStatus const status =
+                ProcessOrphanedAuction(auction);
+            if (status != MailPersistenceStatus::Committed)
+                sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                         "Auction %u orphan cancel failed (status %u); row kept",
+                         auction->Id, uint32(status));
 
-            // item will deleted or added to received mail list
-            MailDraft(msgAuctionCanceledOwner.str(), "")    // TODO: fix body
-            .AddItem(pItem)
-            .SendMailTo(MailReceiver(ObjectGuid(HIGHGUID_PLAYER, auction->owner)), auction, MAIL_CHECK_MASK_COPIED);
-
-            RemoveAItem(auction->itemGuidLow);
-            auction->DeleteFromDB();
             delete auction;
-
             continue;
         }
 
@@ -637,13 +902,11 @@ void AuctionHouseObject::Update()
 
         next = itr;
         ++next;
+        if (entry->recoveryBlocked)
+            continue;
         if (curTime > (entry->expireTime))
         {
-            // Either cancel the auction if there was no bidder
-            if (entry->bidder == 0)
-                sAuctionMgr.SendAuctionExpiredMail(entry);
-            // Or perform the transaction
-            else
+            if (entry->bidder != 0)
             {
                 PlayerTransactionData data;
                 data.type = "Bid";
@@ -655,21 +918,24 @@ void AuctionHouseObject::Update()
                 data.parts[1].lowGuid = entry->bidder;
                 data.parts[1].money = entry->bid;
                 sWorld.LogTransaction(data);
-
-                //we should send an "item sold" message if the seller is online
-                //we send the item to the winner
-                //we send the money to the seller
-                sAuctionMgr.SendAuctionSuccessfulMail(entry);
-                sAuctionMgr.SendAuctionWonMail(entry);
             }
 
-            // In any case clear the auction
-            entry->DeleteFromDB();
-            sAuctionMgr.RemoveAItem(entry->itemGuidLow);
-            // Invalidates the ref to itr, cannot call delete on itr->second
-            // after removal
-            RemoveAuction(entry);
+            // One checked unit: mails, Item ownership and the auction row.
+            MailPersistenceStatus const status =
+                sAuctionMgr.ProcessExpiredAuction(entry);
+            if (status != MailPersistenceStatus::Committed)
+            {
+                // Keep the listing and its Item for a later attempt; never
+                // delete auction/Item rows after a failed unit.
+                sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                         "Auction %u expiry/sale failed (status %u); kept",
+                         entry->Id, uint32(status));
+                continue;
+            }
 
+            // Invalidates the ref to itr, cannot call delete on itr->second
+            // after removal.
+            RemoveAuction(entry);
             delete entry;
             entry = nullptr;
         }
@@ -860,6 +1126,60 @@ void AuctionEntry::DeleteFromDB() const
 {
     //No SQL injection (Id is integer)
     CharacterDatabase.PExecute("DELETE FROM `auction` WHERE `id` = '%u'", Id);
+}
+
+bool AuctionEntry::AppendDeleteFromDB(CharacterPersistenceContext& context) const
+{
+    Database* database = context.Batch().GetDatabase();
+    if (!database)
+    {
+        context.Invalidate();
+        return false;
+    }
+    static SqlStatementID deleteAuction;
+    SqlStatement statement = database->CreateStatement(
+        deleteAuction, "DELETE FROM `auction` WHERE `id` = ?");
+    statement.addUInt32(Id);
+    if (!statement.AppendToCheckedBatch(
+            context.Batch(), SqlAffectedRowsPolicy::ExactlyOne))
+    {
+        context.Invalidate();
+        return false;
+    }
+    return true;
+}
+
+bool AuctionEntry::AppendSaveToDB(CharacterPersistenceContext& context) const
+{
+    Database* database = context.Batch().GetDatabase();
+    if (!database || !auctionHouseEntry)
+    {
+        context.Invalidate();
+        return false;
+    }
+    static SqlStatementID insertAuction;
+    SqlStatement statement = database->CreateStatement(
+        insertAuction,
+        "INSERT INTO `auction` (`id`, `house_id`, `item_guid`, `item_id`, `seller_guid`, `buyout_price`, `expire_time`, `buyer_guid`, `last_bid`, `start_bid`, `deposit`) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    statement.addUInt32(Id);
+    statement.addUInt32(auctionHouseEntry->houseId);
+    statement.addUInt32(itemGuidLow);
+    statement.addUInt32(itemTemplate);
+    statement.addUInt32(owner);
+    statement.addUInt32(buyout);
+    statement.addUInt64(uint64(expireTime));
+    statement.addUInt32(bidder);
+    statement.addUInt32(bid);
+    statement.addUInt32(startbid);
+    statement.addUInt32(deposit);
+    if (!statement.AppendToCheckedBatch(
+            context.Batch(), SqlAffectedRowsPolicy::ExactlyOne))
+    {
+        context.Invalidate();
+        return false;
+    }
+    return true;
 }
 
 void AuctionEntry::SaveToDB() const

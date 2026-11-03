@@ -30,9 +30,27 @@
 #include "AuctionHouseMgr.h"
 #include "TransactionLog.h"
 #include "Mail.h"
+#include "Mail/MailPersistence.h"
 #include "Util.h"
 #include "Chat.h"
 #include "Anticheat.h"
+#include "Database/CharacterPersistenceContext.h"
+#include "Database/CharacterPersistenceRecovery.h"
+#include "Database/DatabaseEnv.h"
+#include "Database/SqlPreparedStatement.h"
+
+namespace
+{
+CharacterIdentitySnapshot AuctionHandlerIdentity(Player const& player)
+{
+    CharacterIdentitySnapshot identity;
+    identity.guid = player.GetGUIDLow();
+    identity.accountId = player.GetSession() ? player.GetSession()->GetAccountId() : 0;
+    identity.canonicalName = player.GetName();
+    identity.generation = player.GetIdentityGeneration();
+    return identity;
+}
+}
 
 // please DO NOT use iterator++, because it is slower than ++iterator!!!
 // post-incrementation is always slower than pre-incrementation !
@@ -167,6 +185,32 @@ void WorldSession::SendAuctionOutbiddedMail(AuctionEntry* auction)
         .SetMoney(auction->bid)
         .SendMailTo(MailReceiver(oldBidder, oldBidder_guid), auction, MAIL_CHECK_MASK_COPIED);
     }
+}
+
+// Stages the outbid refund in the caller's checked unit.
+static bool AppendAuctionOutbiddedMail(CharacterPersistenceContext& context,
+                                       AuctionEntry* auction,
+                                       uint32 oldBidderGuid, uint32 oldBid)
+{
+    ObjectGuid oldBidder_guid(HIGHGUID_PLAYER, oldBidderGuid);
+    Player* oldBidder = sObjectMgr.GetPlayer(oldBidder_guid);
+    uint32 oldBidder_accId = oldBidder ? 0
+        : sObjectMgr.GetPlayerAccountIdByGUID(oldBidder_guid);
+    if (!oldBidder && !oldBidder_accId)
+        return true;                                    // no recipient
+
+    std::ostringstream subject;
+    subject << auction->itemTemplate << ":0:" << AUCTION_OUTBIDDED;
+    uint32 mailId = 0;
+    if (!MailDraft(subject.str()).SetMoney(oldBid).AppendSendTo(
+            context, MailReceiver(oldBidder, oldBidder_guid), auction,
+            MAIL_CHECK_MASK_COPIED, 0, 0, mailId))
+        return false;
+    context.OnCommit([oldBidder, auction]() {
+        if (oldBidder)
+            oldBidder->GetSession()->SendAuctionBidderNotification(auction, false);
+    });
+    return true;
 }
 
 // this function sends mail, when auction is cancelled to old bidder
@@ -393,17 +437,61 @@ void WorldSession::HandleAuctionSellItem(WorldPackets::AuctionHouse::AuctionSell
     data.parts[1].money = packet.buyout;
     sWorld.LogTransaction(data);
 
-    auctionHouse->AddAuction(AH);
+    // Stage the inventory move locally so the save unit sees the removed item;
+    // the destination is kept only for a known-failure restore.
+    ItemPosCountVec restoreDest;
+    uint8 restoreBagSlot = 0;
+    bool const canRestore = pl->CanStoreItem(NULL_BAG, NULL_SLOT, restoreDest,
+                                             it, restoreBagSlot, false) == EQUIP_ERR_OK;
 
-    sAuctionMgr.AddAItem(it);
+    CharacterPersistenceAdmission admission;
+    if (!admission.Admit({GetAccountId()}, AccountLifecycleKind::Mutation))
+    {
+        SendAuctionCommandResult(AH, AUCTION_STARTED, AUCTION_ERR_DATABASE);
+        return;
+    }
+
     pl->MoveItemFromInventory(it->GetBagSlot(), it->GetSlot(), true);
 
-    CharacterDatabase.BeginTransaction(pl->GetGUIDLow());
-    it->DeleteFromInventoryDB();
-    it->SaveToDB();                                         // recursive and not have transaction guard into self, not in inventiory and can be save standalone
-    AH->SaveToDB();
-    pl->SaveInventoryAndGoldToDB();
-    CharacterDatabase.CommitTransaction();
+    CharacterIdentitySnapshot const identity = AuctionHandlerIdentity(*pl);
+    CharacterPersistenceContext context(CharacterDatabase, identity.guid);
+    bool assembled =
+        context.AppendIdentityGuards({identity}) &&
+        it->AppendSaveToDB(context, pl) &&
+        it->AppendInventoryRemovalToDB(context) &&
+        AH->AppendSaveToDB(context) &&
+        pl->AppendInventoryToDB(context) &&
+        pl->AppendGoldToDB(context);
+    if (assembled)
+    {
+        pl->AppendIdentityGenerationPublication(context);
+        SqlBatchResult const result = context.Execute();
+        assembled = result.outcome == SqlWriteOutcome::Succeeded &&
+                    result.stage == SqlBatchStage::Complete;
+        if (!assembled)
+        {
+            if (result.outcome == SqlWriteOutcome::OutcomeUnknown)
+                BlockCharacterRecovery(CharacterRecoveryRecord{
+                    CharacterRecoveryKind::WholeSave, {identity.guid},
+                    {identity.accountId}, identity.generation,
+                    "auction placement outcome unknown"});
+            sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                     "Auction placement failed for guid %u (outcome %u, stage %u)",
+                     identity.guid, uint32(result.outcome), uint32(result.stage));
+        }
+    }
+
+    if (!assembled)
+    {
+        if (canRestore)
+            pl->MoveItemToInventory(restoreDest, it, true);
+        SendAuctionCommandResult(AH, AUCTION_STARTED, AUCTION_ERR_DATABASE);
+        return;
+    }
+
+    // Publication only after the composed unit committed.
+    auctionHouse->AddAuction(AH);
+    sAuctionMgr.AddAItem(it);
 
     SendAuctionCommandResult(AH, AUCTION_STARTED, AUCTION_OK);
 }
@@ -450,6 +538,13 @@ void WorldSession::HandleAuctionPlaceBid(WorldPackets::AuctionHouse::AuctionPlac
     {
         // item not found; auction may have expired, or been bought out
         SendAuctionCommandResult(nullptr, AUCTION_BID_PLACED, AUCTION_ERR_ITEM_NOT_FOUND);
+        return;
+    }
+
+    if (auction->recoveryBlocked)
+    {
+        SendAuctionCommandResult(nullptr, AUCTION_BID_PLACED,
+                                 AUCTION_ERR_DATABASE);
         return;
     }
 
@@ -504,39 +599,111 @@ void WorldSession::HandleAuctionPlaceBid(WorldPackets::AuctionHouse::AuctionPlac
 
     if ((packet.price < auction->buyout) || (auction->buyout == 0))// bid
     {
-        if (pl->GetGUIDLow() == auction->bidder)
-            pl->LogModifyMoney(-int32(packet.price - auction->bid), "AuctionBid", ObjectGuid(HIGHGUID_PLAYER, auction->owner), auction->itemTemplate);
-        else
+        uint32 const previousBidder = auction->bidder;
+        uint32 const previousBid = auction->bid;
+        uint32 const newBidder = pl->GetGUIDLow();
+        int32 const paid = newBidder == previousBidder
+            ? int32(packet.price - previousBid) : int32(packet.price);
+
+        CharacterIdentitySnapshot const identity = AuctionHandlerIdentity(*pl);
+        CharacterPersistenceAdmission admission;
+        std::vector<uint32> accounts{identity.accountId};
+        if (previousBidder && previousBidder != newBidder)
         {
-            pl->LogModifyMoney(-int32(packet.price), "AuctionBid", ObjectGuid(HIGHGUID_PLAYER, auction->owner), auction->itemTemplate);
-            if (auction->bidder)                            // return money to old bidder if present
-                SendAuctionOutbiddedMail(auction);
+            uint32 const account = sObjectMgr.GetPlayerAccountIdByGUID(
+                ObjectGuid(HIGHGUID_PLAYER, previousBidder));
+            if (account)
+                accounts.push_back(account);
         }
 
-        auction->bidder = pl->GetGUIDLow();
-        auction->bid = packet.price;
+        CharacterPersistenceContext context(CharacterDatabase, identity.guid);
+        Database* database = context.Batch().GetDatabase();
+        bool assembled = admission.Admit(accounts, AccountLifecycleKind::Mutation) &&
+                         context.AppendIdentityGuards({identity});
+        if (assembled && database)
+        {
+            static SqlStatementID updateAuctionBid;
+            SqlStatement statement = database->CreateStatement(
+                updateAuctionBid,
+                "UPDATE `auction` SET `buyer_guid` = ?, `last_bid` = ? "
+                "WHERE `id` = ? AND `buyer_guid` = ? AND `last_bid` = ?");
+            statement.addUInt32(newBidder);
+            statement.addUInt32(packet.price);
+            statement.addUInt32(auction->Id);
+            statement.addUInt32(previousBidder);
+            statement.addUInt32(previousBid);
+            assembled = statement.AppendToCheckedBatch(
+                            context.Batch(), SqlAffectedRowsPolicy::ExactlyOne) &&
+                        pl->AppendGoldProjectedToDB(context,
+                                                    pl->GetMoney() - uint32(paid));
+            if (assembled && previousBidder && previousBidder != newBidder)
+                assembled = sAuctionMgr.AppendAuctionOutbiddedMail(
+                    context, auction, previousBidder, previousBid);
+        }
+        else
+            assembled = false;
 
-        if (auction_owner)
-            auction_owner->GetSession()->SendAuctionOwnerNotification(auction, false);
+        if (!assembled)
+        {
+            SendAuctionCommandResult(auction, AUCTION_BID_PLACED,
+                                     AUCTION_ERR_DATABASE);
+            return;
+        }
 
-        // after this update we should save player's money ...
-        CharacterDatabase.PExecute("UPDATE `auction` SET `buyer_guid` = '%u', `last_bid` = '%u' WHERE `id` = '%u'", auction->bidder, auction->bid, auction->Id);
+        context.OnCommit([pl, auction, packet, auction_owner, paid,
+                          newBidder, previousBidder, previousBid]() {
+            pl->LogModifyMoney(-paid, "AuctionBid",
+                               ObjectGuid(HIGHGUID_PLAYER, auction->owner),
+                               auction->itemTemplate);
+            auction->bidder = newBidder;
+            auction->bid = packet.price;
+            if (auction_owner)
+                auction_owner->GetSession()->SendAuctionOwnerNotification(
+                    auction, false);
+            (void)previousBidder;
+            (void)previousBid;
+        });
+        pl->AppendIdentityGenerationPublication(context);
+
+        SqlBatchResult const result = context.Execute();
+        if (result.outcome != SqlWriteOutcome::Succeeded ||
+            result.stage != SqlBatchStage::Complete)
+        {
+            if (result.outcome == SqlWriteOutcome::OutcomeUnknown)
+            {
+                auction->recoveryBlocked = true;
+                BlockCharacterRecovery(CharacterRecoveryRecord{
+                    CharacterRecoveryKind::WholeSave, {identity.guid},
+                    {identity.accountId}, identity.generation,
+                    "auction bid outcome unknown"});
+                if (previousBidder && previousBidder != identity.guid)
+                {
+                    uint32 const account = sObjectMgr.GetPlayerAccountIdByGUID(
+                        ObjectGuid(HIGHGUID_PLAYER, previousBidder));
+                    BlockCharacterRecovery(CharacterRecoveryRecord{
+                        CharacterRecoveryKind::WholeSave, {previousBidder},
+                        {account}, 0,
+                        "auction bid counterparty outcome unknown"});
+                }
+            }
+            sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                     "Auction bid %u failed (outcome %u, stage %u)",
+                     auction->Id, uint32(result.outcome), uint32(result.stage));
+            SendAuctionCommandResult(auction, AUCTION_BID_PLACED,
+                                     AUCTION_ERR_DATABASE);
+            return;
+        }
 
         SendAuctionCommandResult(auction, AUCTION_BID_PLACED, AUCTION_OK);
+        return;
     }
     else                                                    // buyout
     {
-        if (pl->GetGUIDLow() == auction->bidder)
-            pl->LogModifyMoney(-int32(auction->buyout - auction->bid), "AuctionBuyout", ObjectGuid(HIGHGUID_PLAYER, auction->owner), auction->itemTemplate);
-        else
-        {
-            pl->LogModifyMoney(-int32(auction->buyout), "AuctionBuyout", ObjectGuid(HIGHGUID_PLAYER, auction->owner), auction->itemTemplate);
-            if (auction->bidder)                            // return money to old bidder if present
-                SendAuctionOutbiddedMail(auction);
-        }
-
-        auction->bidder = pl->GetGUIDLow();
-        auction->bid = auction->buyout;
+        uint32 const previousBidder = auction->bidder;
+        uint32 const previousBid = auction->bid;
+        int32 const paid = pl->GetGUIDLow() == previousBidder
+            ? int32(auction->buyout - previousBid)
+            : int32(auction->buyout);
 
         PlayerTransactionData data;
         data.type = "Buyout";
@@ -545,24 +712,30 @@ void WorldSession::HandleAuctionPlaceBid(WorldPackets::AuctionHouse::AuctionPlac
         Item* item = sAuctionMgr.GetAItem(auction->itemGuidLow);
         data.parts[0].itemsCount[0] = item ? item->GetCount() : 0;
         data.parts[0].itemsGuid[0] = auction->itemGuidLow;
-        data.parts[1].lowGuid = auction->bidder;
-        data.parts[1].money = auction->bid;
+        data.parts[1].lowGuid = pl->GetGUIDLow();
+        data.parts[1].money = auction->buyout;
         sWorld.LogTransaction(data);
 
-        sAuctionMgr.SendAuctionSuccessfulMail(auction);
-        sAuctionMgr.SendAuctionWonMail(auction);
+        // Buyer gold, old-bidder refund, both mails, Item ownership and the
+        // auction row are one checked unit.
+        MailPersistenceStatus const status =
+            sAuctionMgr.ProcessBuyoutAuction(auction, pl, paid,
+                                             previousBidder, previousBid);
+        if (status != MailPersistenceStatus::Committed)
+        {
+            sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                     "Auction %u buyout failed (status %u); listing kept",
+                     auction->Id, uint32(status));
+            SendAuctionCommandResult(auction, AUCTION_BID_PLACED,
+                                     AUCTION_ERR_DATABASE);
+            return;
+        }
 
         SendAuctionCommandResult(auction, AUCTION_BID_PLACED, AUCTION_OK);
-
-        sAuctionMgr.RemoveAItem(auction->itemGuidLow);
         auctionHouse->RemoveAuction(auction);
-        auction->DeleteFromDB();
-
         delete auction;
+        return;
     }
-    CharacterDatabase.BeginTransaction(pl->GetGUIDLow());
-    pl->SaveInventoryAndGoldToDB();
-    CharacterDatabase.CommitTransaction();
 }
 
 // this void is called when auction_owner cancels his auction
@@ -581,52 +754,44 @@ void WorldSession::HandleAuctionRemoveItem(WorldPackets::AuctionHouse::AuctionRe
     AuctionEntry* auction = auctionHouse->GetAuction(packet.auctionId);
     Player* pl = GetPlayer();
 
-    if (auction && auction->owner == pl->GetGUIDLow())
-    {
-        Item *pItem = sAuctionMgr.GetAItem(auction->itemGuidLow);
-        if (pItem)
-        {
-            if (auction->bidder > 0)                        // If we have a bidder, we have to send him the money he paid
-            {
-                uint32 auctionCut = auction->GetAuctionCut();
-                if (pl->GetMoney() < auctionCut)            // player doesn't have enough money, maybe message needed
-                    return;
-
-                SendAuctionCancelledToBidderMail(auction);
-                pl->ModifyMoney(-int32(auctionCut));
-            }
-            // Return the item by mail
-            std::ostringstream msgAuctionCanceledOwner;
-            msgAuctionCanceledOwner << auction->itemTemplate << ":0:" << AUCTION_CANCELED;
-
-            // item will deleted or added to received mail list
-            MailDraft(msgAuctionCanceledOwner.str())
-            .AddItem(pItem)
-            .SendMailTo(pl, auction, MAIL_CHECK_MASK_COPIED);
-        }
-        else
-        {
-            sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "Auction id: %u has nonexistent item (item guid : %u)!!!", auction->Id, auction->itemGuidLow);
-            SendAuctionCommandResult(nullptr, AUCTION_REMOVED, AUCTION_ERR_INVENTORY, EQUIP_ERR_ITEM_NOT_FOUND);
-            return;
-        }
-    }
-    else
+    if (auction && auction->recoveryBlocked)
     {
         SendAuctionCommandResult(nullptr, AUCTION_REMOVED, AUCTION_ERR_DATABASE);
-        // this code isn't possible ... maybe there should be ASSERT
+        return;
+    }
+
+    if (!auction || auction->owner != pl->GetGUIDLow())
+    {
+        SendAuctionCommandResult(nullptr, AUCTION_REMOVED, AUCTION_ERR_DATABASE);
         sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "CHEATER : %u, he tried to cancel auction (id: %u) of another player, or auction is nullptr", pl->GetGUIDLow(), packet.auctionId);
         return;
     }
 
-    // inform player, that auction is removed
+    if (!sAuctionMgr.GetAItem(auction->itemGuidLow))
+    {
+        sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "Auction id: %u has nonexistent item (item guid : %u)!!!", auction->Id, auction->itemGuidLow);
+        SendAuctionCommandResult(nullptr, AUCTION_REMOVED, AUCTION_ERR_INVENTORY, EQUIP_ERR_ITEM_NOT_FOUND);
+        return;
+    }
+
+    uint32 const auctionCut = auction->bidder ? auction->GetAuctionCut() : 0;
+    if (auctionCut > 0 && pl->GetMoney() < auctionCut)
+        return;
+
+    // Owner gold, bidder refund, both mails, Item ownership and the auction
+    // row are one checked unit.
+    MailPersistenceStatus const status =
+        sAuctionMgr.ProcessCancelAuction(auction, pl, auctionCut);
+    if (status != MailPersistenceStatus::Committed)
+    {
+        sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                 "Auction %u cancel failed (status %u); listing kept",
+                 auction->Id, uint32(status));
+        SendAuctionCommandResult(auction, AUCTION_REMOVED, AUCTION_ERR_DATABASE);
+        return;
+    }
+
     SendAuctionCommandResult(auction, AUCTION_REMOVED, AUCTION_OK);
-    // Now remove the auction
-    CharacterDatabase.BeginTransaction(pl->GetGUIDLow());
-    auction->DeleteFromDB();
-    pl->SaveInventoryAndGoldToDB();
-    CharacterDatabase.CommitTransaction();
-    sAuctionMgr.RemoveAItem(auction->itemGuidLow);
     auctionHouse->RemoveAuction(auction);
     delete auction;
 }

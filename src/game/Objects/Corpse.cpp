@@ -144,6 +144,9 @@ void Corpse::DeleteBonesFromWorld()
 
 void Corpse::DeleteFromDB()
 {
+    if (m_dbRowDeleted)
+        return;
+
     // bones should not be saved to DB (would be deleted on startup anyway)
     MANGOS_ASSERT(GetType() != CORPSE_BONES);
 

@@ -437,7 +437,7 @@ bool ChatHandler::HandleAddCharacterNoteCommand(char* args)
         SetSentErrorMessage(true);
         return false;
     }
-    PlayerCacheData const* playerData = sObjectMgr.GetPlayerDataByGUID(playerGuid.GetCounter());
+    PlayerCacheSnapshot playerData = sObjectMgr.GetPlayerDataByGUID(playerGuid.GetCounter());
     if (!playerData)
     {
         PSendSysMessage(LANG_PLAYER_NOT_FOUND);
@@ -465,7 +465,7 @@ bool ChatHandler::HandleWarnCharacterCommand(char* args)
         SetSentErrorMessage(true);
         return false;
     }
-    PlayerCacheData const* playerData = sObjectMgr.GetPlayerDataByGUID(playerGuid.GetCounter());
+    PlayerCacheSnapshot playerData = sObjectMgr.GetPlayerDataByGUID(playerGuid.GetCounter());
     if (!playerData)
     {
         PSendSysMessage(LANG_PLAYER_NOT_FOUND);
@@ -1157,7 +1157,7 @@ bool ChatHandler::HandleMuteCommand(char* args)
 
     // Add warning to the account
     std::string authorName = m_session ? m_session->GetPlayerName() : "Console";
-    PlayerCacheData const* playerData = sObjectMgr.GetPlayerDataByGUID(target_guid);
+    PlayerCacheSnapshot playerData = sObjectMgr.GetPlayerDataByGUID(target_guid);
     ASSERT(playerData);
     std::stringstream reason;
     reason << playerData->sName << " muted " << notspeaktime << " minutes";

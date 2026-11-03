@@ -37,6 +37,7 @@
 #include <memory>
 
 class WorldSession;
+class CharacterPersistenceContext;
 class Map;
 class BattleGround;
 class DungeonPersistentState;
@@ -220,6 +221,13 @@ class Group
         bool   AddLeaderInvite(Player* player);
         bool   AddMember(ObjectGuid guid, char const* name, uint8 joinMethod = GROUP_JOIN);
         uint32 RemoveMember(ObjectGuid guid, uint8 removeMethod); // method: 0=just remove, 1=kick
+        /// Deletion-only append/apply seams: SQL is staged into the deletion's
+        /// checked batch, local membership/broadcast effects run after commit.
+        bool AppendDeletionMemberRemoval(
+            CharacterPersistenceContext& context, ObjectGuid guid,
+            struct GroupDeletionMemberPlan& plan);
+        void ApplyDeletionMemberRemoval(
+            struct GroupDeletionMemberPlan const& plan);
         void   ChangeLeader(ObjectGuid guid);
         void   SetLootMethod(LootMethod method) { m_lootMethod = method; }
         void   SetLooterGuid(ObjectGuid guid) { m_looterGuid = guid; }

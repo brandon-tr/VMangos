@@ -57,6 +57,7 @@ typedef std::map<uint32,ReputationRank> ForcedReactions;
 
 class Player;
 class QueryResult;
+class CharacterPersistenceContext;
 
 class ReputationMgr
 {
@@ -65,6 +66,7 @@ class ReputationMgr
         ~ReputationMgr() {}
 
         void SaveToDB();
+        bool AppendSaveToDB(CharacterPersistenceContext& context);
         void LoadFromDB(std::unique_ptr<QueryResult> result);
     public:                                                 // statics
         static int32 const PointsInRank[MAX_REPUTATION_RANK];

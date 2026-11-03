@@ -34,6 +34,7 @@
 #include "ObjectGuid.h"
 #include "Policies/Singleton.h"
 #include "SQLStorages.h"
+#include "PlayerIdentityCache.h"
 
 #include <string>
 #include <map>
@@ -444,25 +445,6 @@ struct SavedVariable
 };
 typedef std::vector<SavedVariable> SavedVariablesVector;
 
-struct PlayerCacheData
-{
-    uint32 uiGuid;
-    uint32 uiLevel;
-    uint32 uiAccount;
-    uint32 uiRace;
-    uint32 uiClass;
-    uint32 uiGender;
-    uint32 uiZoneId;
-    uint32 uiMapId;
-    std::string sName;
-    float fPosX;
-    float fPosY;
-    float fPosZ;
-    float fOrientation;
-    bool bInFlight;
-};
-typedef std::map<uint32 /*guid*/, PlayerCacheData> PlayerCacheDataMap;
-
 struct FactionChangeMountData
 {
     Races RaceId;
@@ -589,6 +571,28 @@ struct PlayerPremadeSpecTemplate
 };
 typedef std::unordered_map<uint32, PlayerPremadeGearTemplate> PlayerPremadeGearMap;
 typedef std::unordered_map<uint32, PlayerPremadeSpecTemplate> PlayerPremadeSpecMap;
+
+/// Owns a temporarily reserved canonical player name. The reservation keeps
+/// generated bot names unique until the name is either persisted or released.
+class PlayerNameReservation
+{
+    public:
+        PlayerNameReservation() = default;
+        PlayerNameReservation(PlayerNameReservation&& other) noexcept;
+        PlayerNameReservation& operator=(PlayerNameReservation&& other) noexcept;
+        ~PlayerNameReservation();
+        PlayerNameReservation(PlayerNameReservation const&) = delete;
+        PlayerNameReservation& operator=(PlayerNameReservation const&) = delete;
+
+        std::string const& Name() const { return m_name; }
+        explicit operator bool() const { return m_active; }
+        void Release();
+
+    private:
+        friend class ObjectMgr;
+        std::string m_name;
+        bool m_active = false;
+};
 
 class ObjectMgr
 {
@@ -968,6 +972,7 @@ class ObjectMgr
         void LoadTrainers() { LoadTrainers("npc_trainer", false); }
 
         std::string GenerateFreePlayerName();
+        PlayerNameReservation ReserveFreePlayerName();
         std::string GeneratePetName(uint32 entry);
         uint32 GetBaseXP(uint32 level) const;
         uint32 GetXPForLevel(uint32 level) const;
@@ -1345,23 +1350,18 @@ class ObjectMgr
         SavedVariablesVector m_SavedVariables;
 
         // Caching Player Data
-        void LoadPlayerCacheData(uint32 lowGuid = 0);
-        PlayerCacheData* GetPlayerDataByGUID(uint32 lowGuid);
-        PlayerCacheData const* GetPlayerDataByGUID(uint32 lowGuid) const;
-        PlayerCacheData const* GetPlayerDataByName(std::string const& name) const;
-        void GetPlayerDataForAccount(uint32 accountId, std::vector<PlayerCacheData const*>& data) const;
-        PlayerCacheData* InsertPlayerInCache(Player* pPlayer);
-        PlayerCacheData* InsertPlayerInCache(uint32 lowGuid, uint32 race, uint32 _class, uint32 uiGender, uint32 account, std::string const& name, uint32 level, uint32 zoneId);
+        bool LoadPlayerCacheData(uint32 lowGuid = 0);
+        PlayerCacheSnapshot GetPlayerDataByGUID(uint32 lowGuid) const;
+        PlayerCacheSnapshot GetPlayerDataByName(std::string const& name) const;
+        void GetPlayerDataForAccount(uint32 accountId, std::vector<PlayerCacheSnapshot>& data) const;
+        PlayerCacheSnapshot InsertPlayerInCache(Player* pPlayer);
+        PlayerCacheSnapshot InsertPlayerInCache(uint32 lowGuid, uint32 race, uint32 _class, uint32 uiGender, uint32 account, std::string const& name, uint32 level, uint32 zoneId);
         void DeletePlayerFromCache(uint32 lowGuid);
-        void ChangePlayerNameInCache(uint32 lowGuid, std::string const& oldName, std::string const& newName);
+        bool ChangePlayerNameInCache(uint32 lowGuid, std::string const& oldName, std::string const& newName);
         void UpdatePlayerCachedPosition(Player* pPlayer);
         void UpdatePlayerCachedPosition(uint32 lowGuid, uint32 mapId, float posX, float posY, float posZ, float o, bool inFlight);
-        void UpdatePlayerCachedPosition(PlayerCacheData* data, uint32 mapId, float posX, float posY, float posZ, float o, bool inFlight);
         void UpdatePlayerCache(Player* pPlayer);
-        void UpdatePlayerCache(PlayerCacheData* data, uint32 race, uint32 _class, uint32 gender, uint32 accountId, std::string const& name, uint32 level, uint32 zoneId);
-
-        PlayerCacheDataMap m_playerCacheData;
-        std::map<std::string, uint32> m_playerNameToGuid;
+        void UpdatePlayerCachedLevelAndZone(uint32 lowGuid, uint32 level, uint32 zoneId);
 
         uint32 AddCreData(uint32 entry, uint32 team, uint32 map, float, float, float, float, uint32 spawnDelay);
         uint32 AddGOData(uint32 entry, uint32 map, float, float, float, float, uint32 spawnTimeDelay, float, float, float, float);
@@ -1551,6 +1551,8 @@ class ObjectMgr
         uint32 m_OldMailCounter;
 
     private:
+        PlayerIdentityCache m_playerIdentityCache;
+
         void LoadGameObjectInfo(Field* result);
         void LoadCreatureInfo(Field* result);
         void LoadCreatureAddons(SQLStorage& creatureaddons, char const* entryName, char const* comment);

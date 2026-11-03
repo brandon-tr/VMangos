@@ -37,6 +37,7 @@ set (game_SRCS
     ObjectMgr.cpp
     ObjectPosSelector.cpp
     PlayerDump.cpp
+    PlayerIdentityCache.cpp
     QuestDef.cpp
     ReputationMgr.cpp
     ScriptMgr.cpp
@@ -93,7 +94,15 @@ set (game_SRCS
     Commands/UnitCommands.cpp
     Database/CharacterDatabaseCache.cpp
     Database/CharacterDatabaseCleaner.cpp
+    Database/CharacterIdentityPersistence.cpp
+    Database/CharacterDeletionRelationships.cpp
+    Database/CharacterNameSchema.cpp
+    Database/CharacterStatePersistence.cpp
+    Database/CharacterSavePersistence.cpp
+    Database/CharacterPersistenceContext.cpp
+    Database/CharacterPersistenceRecovery.cpp
     Database/DBCStores.cpp
+    Database/PlayerNameLists.cpp
     Database/SQLStorages.cpp
     Group/CreatureLinkingMgr.cpp
     Group/Group.cpp
@@ -129,6 +138,7 @@ set (game_SRCS
     LFG/LFGMgr.cpp
     LFG/LFGQueue.cpp
     Mail/Mail.cpp
+    Mail/MailPersistence.cpp
     Mail/MassMailMgr.cpp
     Maps/GridMap.cpp
     Maps/GridNotifiers.cpp
@@ -276,6 +286,7 @@ set (game_SRCS
     ObjectPosSelector.h
     PacketProcessing.h
     PlayerDump.h
+    PlayerIdentityCache.h
     QuestDef.h
     ReputationMgr.h
     ScriptedGossip.h
@@ -344,9 +355,16 @@ set (game_SRCS
     Chat/MonsterChatBuilder.h
     Database/CharacterDatabaseCache.h
     Database/CharacterDatabaseCleaner.h
+    Database/CharacterIdentityPersistence.h
+    Database/CharacterDeletionRelationships.h
+    Database/CharacterNameSchema.h
+    Database/CharacterNameSchemaChecks.h
+    Database/CharacterPersistenceContext.h
+    Database/CharacterPersistenceRecovery.h
     Database/DBCEnums.h
     Database/DBCfmt.h
     Database/DBCStores.h
+    Database/PlayerNameLists.h
     Database/DBCStructure.h
     Database/SQLStorages.h
     Group/CreatureLinkingMgr.h
@@ -361,6 +379,7 @@ set (game_SRCS
     LFG/LFGMgr.h
     LFG/LFGQueue.h
     Mail/Mail.h
+    Mail/MailPersistence.h
     Mail/MassMailMgr.h
     Maps/Cell.h
     Maps/CellImpl.h

@@ -26,6 +26,8 @@
 #include "Opcodes.h"
 #include "WorldPacket.h"
 #include "Database/DatabaseEnv.h"
+#include "Database/CharacterPersistenceContext.h"
+#include "Database/SqlPreparedStatement.h"
 #include "ItemEnchantmentMgr.h"
 #include "GuildMgr.h"
 
@@ -378,6 +380,246 @@ void Item::SaveToDB()
         SetLootState(ITEM_LOOT_UNCHANGED);
 
     SetState(ITEM_UNCHANGED);
+}
+
+bool Item::AppendInventoryRemovalToDB(CharacterPersistenceContext& context)
+{
+    Database* database = context.Batch().GetDatabase();
+    if (!database)
+    {
+        context.Invalidate();
+        return false;
+    }
+    static SqlStatementID deleteInventory;
+    SqlStatement statement = database->CreateStatement(
+        deleteInventory, "DELETE FROM `character_inventory` WHERE `item_guid` = ?");
+    statement.addUInt32(GetGUIDLow());
+    if (!statement.AppendToCheckedBatch(
+            context.Batch(), SqlAffectedRowsPolicy::Any))
+    {
+        context.Invalidate();
+        return false;
+    }
+    return true;
+}
+
+bool Item::AppendSaveToDB(CharacterPersistenceContext& context, Player* owner)
+{
+    Database* database = context.Batch().GetDatabase();
+    if (!database || context.IsInvalid() || context.WasSubmitted())
+    {
+        context.Invalidate();
+        return false;
+    }
+
+    auto append = [&context](SqlStatement& statement,
+                             SqlAffectedRowsPolicy policy) {
+        return statement.AppendToCheckedBatch(context.Batch(), policy);
+    };
+
+    if (uState == ITEM_UNCHANGED)
+    {
+        // A legacy/stale queue entry can exist while the state is unchanged.
+        // Acknowledge it only after the commit; known rejection must leave it
+        // queued and dirty.
+        if (IsInUpdateQueue())
+            context.OnCommit([this, owner]() { AcknowledgeSave(owner); });
+        return true;
+    }
+
+    if (uState == ITEM_REMOVED)
+    {
+        if (uint32 textId = GetUInt32Value(ITEM_FIELD_ITEM_TEXT_ID))
+        {
+            static SqlStatementID deleteItemText;
+            SqlStatement statement = database->CreateStatement(
+                deleteItemText, "DELETE FROM `item_text` WHERE `id` = ?");
+            statement.addUInt32(textId);
+            if (!append(statement, SqlAffectedRowsPolicy::Any))
+            {
+                context.Invalidate();
+                return false;
+            }
+        }
+
+        static SqlStatementID deleteItem;
+        SqlStatement item = database->CreateStatement(
+            deleteItem, "DELETE FROM `item_instance` WHERE `guid` = ?");
+        item.addUInt32(GetGUIDLow());
+        if (!append(item, SqlAffectedRowsPolicy::Any))
+        {
+            context.Invalidate();
+            return false;
+        }
+
+        if (HasFlag(ITEM_FIELD_FLAGS, ITEM_DYNFLAG_WRAPPED))
+        {
+            static SqlStatementID deleteGift;
+            SqlStatement gift = database->CreateStatement(
+                deleteGift,
+                "DELETE FROM `character_gifts` WHERE `item_guid` = ?");
+            gift.addUInt32(GetGUIDLow());
+            if (!append(gift, SqlAffectedRowsPolicy::Any))
+            {
+                context.Invalidate();
+                return false;
+            }
+        }
+
+        if (HasSavedLoot())
+        {
+            static SqlStatementID deleteLoot;
+            SqlStatement lootStatement = database->CreateStatement(
+                deleteLoot, "DELETE FROM `item_loot` WHERE `guid` = ?");
+            lootStatement.addUInt32(GetGUIDLow());
+            if (!append(lootStatement, SqlAffectedRowsPolicy::Any))
+            {
+                context.Invalidate();
+                return false;
+            }
+        }
+
+        // Destructive removal is deferred to the commit callback.  On failure
+        // or uncertainty the item keeps its ITEM_REMOVED state and stays
+        // queued, so a later save can retry without having destroyed it.
+        context.OnCommit([this, owner]() {
+            if (IsInUpdateQueue() && !AcknowledgeSave(owner))
+                return;                                 // keep for a later save
+            if (IsInWorld())
+                RemoveFromWorld();
+            delete this;
+        });
+        return true;
+    }
+
+    if (uState == ITEM_CHANGED &&
+        HasFlag(ITEM_FIELD_FLAGS, ITEM_DYNFLAG_WRAPPED))
+    {
+        static SqlStatementID updateGift;
+        SqlStatement gift = database->CreateStatement(
+            updateGift,
+            "UPDATE `character_gifts` SET `guid` = ? WHERE `item_guid` = ?");
+        gift.addUInt32(GetOwnerGuid().GetCounter());
+        gift.addUInt32(GetGUIDLow());
+        if (!append(gift, SqlAffectedRowsPolicy::Any))
+        {
+            context.Invalidate();
+            return false;
+        }
+    }
+
+    static SqlStatementID insertItem;
+    static SqlStatementID updateItem;
+    SqlStatement item = (uState == ITEM_NEW)
+        ? database->CreateStatement(
+              insertItem,
+              "REPLACE INTO `item_instance` (`item_id`, `owner_guid`, `creator_guid`, `gift_creator_guid`, `count`, `duration`, `charges`, `flags`, `enchantments`, `random_property_id`, `durability`, `text`, `generated_loot`, `guid`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        : database->CreateStatement(
+              updateItem,
+              "UPDATE `item_instance` SET `item_id` = ?, `owner_guid` = ?, `creator_guid` = ?, `gift_creator_guid` = ?, `count` = ?, `duration` = ?, `charges` = ?, `flags` = ?, `enchantments` = ?, `random_property_id` = ?, `durability` = ?, `text` = ?, `generated_loot` = ? WHERE `guid` = ?");
+    item.addUInt32(GetEntry());
+    item.addUInt32(GetOwnerGuid().GetCounter());
+    item.addUInt32(GetGuidValue(ITEM_FIELD_CREATOR).GetCounter());
+    item.addUInt32(GetGuidValue(ITEM_FIELD_GIFTCREATOR).GetCounter());
+    item.addUInt32(GetCount());
+    item.addUInt32(GetUInt32Value(ITEM_FIELD_DURATION));
+
+    std::ostringstream charges;
+    for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
+        charges << GetSpellCharges(i) << ' ';
+    item.addString(charges.str());
+    item.addUInt32(GetUInt32Value(ITEM_FIELD_FLAGS));
+
+    std::ostringstream enchantments;
+    for (uint8 i = 0; i < MAX_ENCHANTMENT_SLOT; ++i)
+    {
+        enchantments << GetEnchantmentId(EnchantmentSlot(i)) << ' ';
+        enchantments << GetEnchantmentDuration(EnchantmentSlot(i)) << ' ';
+        enchantments << GetEnchantmentCharges(EnchantmentSlot(i)) << ' ';
+    }
+    item.addString(enchantments.str());
+    item.addUInt16(GetItemRandomPropertyId());
+    item.addUInt16(GetUInt32Value(ITEM_FIELD_DURABILITY));
+    item.addUInt32(GetUInt32Value(ITEM_FIELD_ITEM_TEXT_ID));
+    item.addUInt8(generatedLoot);
+    item.addUInt32(GetGUIDLow());
+    if (!append(item, uState == ITEM_NEW ? SqlAffectedRowsPolicy::ExactlyOne
+                                        : SqlAffectedRowsPolicy::Any))
+    {
+        context.Invalidate();
+        return false;
+    }
+
+    if (m_lootState == ITEM_LOOT_CHANGED || m_lootState == ITEM_LOOT_REMOVED)
+    {
+        static SqlStatementID deleteLoot;
+        SqlStatement lootStatement = database->CreateStatement(
+            deleteLoot, "DELETE FROM `item_loot` WHERE `guid` = ?");
+        lootStatement.addUInt32(GetGUIDLow());
+        if (!append(lootStatement, SqlAffectedRowsPolicy::Any))
+        {
+            context.Invalidate();
+            return false;
+        }
+    }
+
+    if (m_lootState == ITEM_LOOT_NEW || m_lootState == ITEM_LOOT_CHANGED)
+    {
+        if (ObjectGuid ownerGuid = GetOwnerGuid())
+        {
+            if (loot.gold)
+            {
+                static SqlStatementID insertGold;
+                SqlStatement gold = database->CreateStatement(
+                    insertGold,
+                    "INSERT INTO `item_loot` (`guid`, `owner_guid`, `item_id`, `amount`, `property`) VALUES (?, ?, 0, ?, 0)");
+                gold.addUInt32(GetGUIDLow());
+                gold.addUInt32(ownerGuid.GetCounter());
+                gold.addUInt32(loot.gold);
+                if (!append(gold, SqlAffectedRowsPolicy::ExactlyOne))
+                {
+                    context.Invalidate();
+                    return false;
+                }
+            }
+
+            for (size_t i = 0; i < loot.GetMaxSlotInLootFor(ownerGuid); ++i)
+            {
+                QuestItem* questItem = nullptr;
+                LootItem* lootItem = loot.LootItemInSlot(
+                    i, ownerGuid, &questItem);
+                if (!lootItem || (!questItem && lootItem->is_blocked))
+                    continue;
+
+                static SqlStatementID insertLoot;
+                SqlStatement entry = database->CreateStatement(
+                    insertLoot,
+                    "INSERT INTO `item_loot` (`guid`, `owner_guid`, `item_id`, `amount`, `property`) VALUES (?, ?, ?, ?, ?)");
+                entry.addUInt32(GetGUIDLow());
+                entry.addUInt32(ownerGuid.GetCounter());
+                entry.addUInt32(lootItem->itemid);
+                entry.addUInt8(lootItem->count);
+                entry.addInt32(lootItem->randomPropertyId);
+                if (!append(entry, SqlAffectedRowsPolicy::ExactlyOne))
+                {
+                    context.Invalidate();
+                    return false;
+                }
+            }
+        }
+    }
+
+    // Dirty-state acknowledgment is publish-only: the item must not appear
+    // saved before Execute() confirms a complete commit.
+    context.OnCommit([this, owner]() {
+        if (m_lootState != ITEM_LOOT_NONE && m_lootState != ITEM_LOOT_TEMPORARY)
+            SetLootState(ITEM_LOOT_UNCHANGED);
+        // Detach the queue pointer while its index is still valid; otherwise a
+        // later ownership transfer would leave a stale pointer behind.
+        AcknowledgeSave(owner);
+    });
+
+    return true;
 }
 
 bool Item::LoadFromDB(uint32 guidLow, ObjectGuid ownerGuid, Field* fields, uint32 entry)
@@ -832,6 +1074,33 @@ void Item::SetItemRandomProperties(int32 randomPropId)
                 SetEnchantment(EnchantmentSlot(i), item_rand->enchant_id[i - PROP_ENCHANTMENT_SLOT_0], 0, 0);
         }
     }
+}
+
+bool Item::AcknowledgeSave(Player* owner)
+{
+    if (!IsInUpdateQueue())
+    {
+        uState = ITEM_UNCHANGED;
+        return true;
+    }
+
+    // The caller may supply the owning Player when it exists outside the
+    // world (logout/forced save); do not rely on the in-world lookup.
+    Player* queueOwner = owner ? owner : GetOwner();
+    if (!queueOwner || queueOwner->GetObjectGuid() != GetOwnerGuid() ||
+        queueOwner->IsItemUpdateQueueBlocked())
+        return false;
+
+    std::vector<Item*>& queue = queueOwner->GetItemUpdateQueue();
+    // Remove every occurrence, including legacy duplicate/stale entries, while
+    // leaving all unrelated queued Items untouched.
+    for (Item*& queued : queue)
+        if (queued == this)
+            queued = nullptr;
+
+    uQueuePos = -1;
+    uState = ITEM_UNCHANGED;
+    return true;
 }
 
 void Item::SetState(ItemUpdateState state, Player* forplayer)

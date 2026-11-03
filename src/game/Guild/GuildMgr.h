@@ -26,6 +26,8 @@
 
 class Guild;
 class ObjectGuid;
+class CharacterPersistenceContext;
+struct PetitionDeletionPlan;
 class Petition;
 class PetitionSignature;
 
@@ -71,6 +73,13 @@ class GuildMgr
         Petition* GetPetitionById(uint32 id);
         Petition* GetPetitionByOwnerGuid(ObjectGuid const& ownerGuid);
         void DeletePetitionSignaturesByPlayer(ObjectGuid guid, uint32 exceptPetitionId = 0);
+        /// Deletion-only seams: stage petition/signature SQL into the deletion
+        /// batch and apply only the local signature removals after commit.
+        bool AppendDeletionPetitionCleanup(
+            CharacterPersistenceContext& context, ObjectGuid guid,
+            struct PetitionDeletionPlan& plan);
+        void ApplyDeletionPetitionCleanup(
+            struct PetitionDeletionPlan const& plan);
 
         void LoadGuilds();
         void LoadPetitions();

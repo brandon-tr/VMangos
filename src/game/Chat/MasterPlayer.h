@@ -14,6 +14,8 @@ class Player;
 struct Mail;
 class Item;
 class Channel;
+class CharacterPersistenceContext;
+class AccountLifecycleLease;
 
 typedef std::map<uint8,ActionButton> ActionButtonList;
 typedef std::deque<Mail*> PlayerMails;
@@ -27,6 +29,13 @@ public:
     void Create(ObjectGuid playerGuid, uint8 raceId, uint32 classId);
     void LoadPlayer(Player* player);
     void SaveToDB();
+    bool AppendActionsToDB(CharacterPersistenceContext& context);
+    bool AppendMailsToDB(CharacterPersistenceContext& context);
+    bool AppendSaveToDB(CharacterPersistenceContext& context);
+    /// True while local state still needs a save.  Used by logout to decide
+    /// whether the composed player save already covered this representation.
+    bool HasPendingSave() const;
+    void SetIdentityGeneration(uint64 generation) { identityGeneration = generation; }
     void Update();
 
     WorldSession* GetSession() const { return m_session; }
@@ -60,7 +69,8 @@ public:
 
     // MAIL SYSTEM
     void LoadMailedItems(std::unique_ptr<QueryResult> result);
-    void LoadMails(std::unique_ptr<QueryResult> result);
+    void LoadMails(std::unique_ptr<QueryResult> result,
+                   AccountLifecycleLease const* lease = nullptr);
     void SaveMails();
     void UpdateNextMailTimeAndUnreads();
     void AddNewMailDeliverTime(time_t deliver_time);
@@ -124,6 +134,7 @@ public:
     uint8 raceId;
     uint8 classId;
     uint32 level;
+    uint64 identityGeneration;
     Team m_team;
     // Guild system variables
     uint32 guildId;
@@ -144,6 +155,10 @@ public:
     // TODO: Group ?
 
 protected:
+    /// One checked operation for this MasterPlayer representation.  Used by
+    /// the standalone entry points only; a composed Player save stages the same
+    /// append seams into its own batch.
+    bool SaveChecked(bool includeActions, bool includeMails);
 
     PlayerSocial* m_social = nullptr;
     ActionButtonList m_actionButtons;

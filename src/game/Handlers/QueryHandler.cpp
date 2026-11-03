@@ -48,7 +48,7 @@ void WorldSession::SendNameQueryOpcode(Player* p)
 void WorldSession::SendNameQueryOpcodeFromDB(ObjectGuid guid)
 {
     // Using the cache...
-    if (PlayerCacheData* pData = sObjectMgr.GetPlayerDataByGUID(guid.GetCounter()))
+    if (PlayerCacheSnapshot pData = sObjectMgr.GetPlayerDataByGUID(guid.GetCounter()))
     {
         auto nameResponse = std::make_unique<WorldPackets::Query::NameQueryResponse>();
         nameResponse->playerGuid = ObjectGuid(HIGHGUID_PLAYER, pData->uiGuid);

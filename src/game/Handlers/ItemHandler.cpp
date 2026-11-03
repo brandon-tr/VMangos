@@ -31,6 +31,10 @@
 #include "Chat.h"
 #include "Conditions.h"
 #include "Anticheat.h"
+#include "Database/CharacterPersistenceContext.h"
+#include "Database/CharacterPersistenceRecovery.h"
+#include "Database/DatabaseEnv.h"
+#include "Database/SqlPreparedStatement.h"
 
 void WorldSession::HandleSplitItemOpcode(WorldPackets::Item::SplitItem const& packet)
 {
@@ -1120,19 +1124,77 @@ void WorldSession::HandleWrapItemOpcode(WorldPackets::Item::WrapItem const& pack
         return;
     }
 
-    CharacterDatabase.BeginTransaction(_player->GetGUIDLow());
-    CharacterDatabase.PExecute("INSERT INTO character_gifts VALUES ('%u', '%u', '%u', '%u')", item->GetOwnerGuid().GetCounter(), item->GetGUIDLow(), item->GetEntry(), item->GetUInt32Value(ITEM_FIELD_FLAGS));
+    // The gift row must record the pre-wrap entry/flags.  The local wrap
+    // mutations happen in legacy order, then the gift row, wrapped item,
+    // inventory rows and gold are staged into one checked unit.
+    uint32 const wrapOwner = item->GetOwnerGuid().GetCounter();
+    uint32 const wrapItemGuid = item->GetGUIDLow();
+    uint32 const giftEntry = item->GetEntry();
+    uint32 const giftFlags = item->GetUInt32Value(ITEM_FIELD_FLAGS);
+    uint32 const originalEntry = item->GetEntry();
+    uint32 const originalFlags = item->GetUInt32Value(ITEM_FIELD_FLAGS);
+    ObjectGuid const originalCreator = item->GetGuidValue(ITEM_FIELD_GIFTCREATOR);
+    ItemUpdateState const originalState = item->GetState();
+    bool const wrappedNew = originalState == ITEM_NEW;
 
     item->SetEntry(gift->GetProto()->WrappedGift);
     item->SetGuidValue(ITEM_FIELD_GIFTCREATOR, _player->GetObjectGuid());
     item->SetUInt32Value(ITEM_FIELD_FLAGS, ITEM_DYNFLAG_WRAPPED);
     item->SetState(ITEM_CHANGED, _player);
 
-    if (item->GetState() == ITEM_NEW)                       // save new item, to have alway for `character_gifts` record in `item_instance`
+    CharacterIdentitySnapshot identity;
+    identity.guid = _player->GetGUIDLow();
+    identity.accountId = GetAccountId();
+    identity.canonicalName = _player->GetName();
+    identity.generation = _player->GetIdentityGeneration();
+
+    CharacterPersistenceContext context(CharacterDatabase, identity.guid);
+    Database* database = context.Batch().GetDatabase();
+    bool assembled = database != nullptr && context.AppendIdentityGuards({identity});
+    if (assembled)
     {
-        _player->SaveInventoryAndGoldToDB();
+        static SqlStatementID insertGift;
+        SqlStatement giftRow = database->CreateStatement(
+            insertGift,
+            "INSERT INTO `character_gifts` (`guid`, `item_guid`, `item_entry`, `flags`) VALUES (?, ?, ?, ?)");
+        giftRow.addUInt32(wrapOwner);
+        giftRow.addUInt32(wrapItemGuid);
+        giftRow.addUInt32(giftEntry);
+        giftRow.addUInt32(giftFlags);
+        assembled = giftRow.AppendToCheckedBatch(
+            context.Batch(), SqlAffectedRowsPolicy::ExactlyOne);
     }
-    CharacterDatabase.CommitTransaction();
+    if (assembled && wrappedNew)
+        assembled = _player->AppendInventoryToDB(context) &&
+                    _player->AppendGoldToDB(context);
+    if (assembled)
+    {
+        _player->AppendIdentityGenerationPublication(context);
+        SqlBatchResult const result = context.Execute();
+        assembled = result.outcome == SqlWriteOutcome::Succeeded &&
+                    result.stage == SqlBatchStage::Complete;
+        if (!assembled)
+        {
+            if (result.outcome == SqlWriteOutcome::OutcomeUnknown)
+                BlockCharacterRecovery(CharacterRecoveryRecord{
+                    CharacterRecoveryKind::WholeSave, {identity.guid},
+                    {identity.accountId}, identity.generation,
+                    "item wrapping outcome unknown"});
+            sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                     "Item wrapping save failed for guid %u (outcome %u, stage %u)",
+                     identity.guid, uint32(result.outcome), uint32(result.stage));
+        }
+    }
+    if (!assembled)
+    {
+        // Known failure: nothing was committed, so undo the local wrap.
+        item->SetEntry(originalEntry);
+        item->SetGuidValue(ITEM_FIELD_GIFTCREATOR, originalCreator);
+        item->SetUInt32Value(ITEM_FIELD_FLAGS, originalFlags);
+        item->FSetState(originalState);
+        _player->SendEquipError(EQUIP_ERR_ITEM_NOT_FOUND, item, nullptr);
+        return;
+    }
 
     uint32 count = 1;
     _player->DestroyItemCount(gift, count, true);

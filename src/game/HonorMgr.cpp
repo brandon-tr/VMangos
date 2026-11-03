@@ -9,6 +9,8 @@
 #include "Creature.h"
 #include "Player.h"
 #include "Database/DatabaseEnv.h"
+#include "Database/CharacterPersistenceContext.h"
+#include "Database/SqlPreparedStatement.h"
 #include "Policies/SingletonImp.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
@@ -750,6 +752,96 @@ void HonorMgr::Save()
         << m_owner->GetUInt32Value(PLAYER_FIELD_LAST_WEEK_KILLS) << ", "
         << m_owner->GetUInt32Value(PLAYER_FIELD_LAST_WEEK_CONTRIBUTION) << ")";
     CharacterDatabase.Execute(ss.str().c_str());*/
+}
+
+bool HonorMgr::AppendSaveToDB(CharacterPersistenceContext& context)
+{
+    if (!m_owner || !m_owner->GetSession())
+    {
+        context.Invalidate();
+        return false;
+    }
+
+    CharacterIdentitySnapshot identity;
+    identity.guid = m_owner->GetGUIDLow();
+    identity.accountId = m_owner->GetSession()->GetAccountId();
+    identity.canonicalName = m_owner->GetName();
+    identity.generation = m_owner->GetIdentityGeneration();
+    if (!context.HasIdentityGuard(identity))
+    {
+        context.Invalidate();
+        return false;
+    }
+
+    struct HonorAck
+    {
+        uint8 victimType;
+        uint32 victimId;
+        float cp;
+        uint32 date;
+        uint8 type;
+    };
+    std::vector<HonorAck> acknowledgments;
+
+    for (HonorCP const& honorCP : m_honorCP)
+    {
+        if (honorCP.state != STATE_NEW)
+            continue;
+
+        static SqlStatementID insertHonor;
+        SqlStatement statement = CharacterDatabase.CreateStatement(
+            insertHonor,
+            "INSERT INTO `character_honor_cp` (`guid`, `victim_type`, `victim_id`, `cp`, `date`, `type`) VALUES (?, ?, ?, ?, ?, ?)");
+        statement.addUInt32(m_owner->GetGUIDLow());
+        statement.addUInt8(honorCP.victimType);
+        statement.addUInt32(honorCP.victimId);
+        statement.addFloat(finiteAlways(honorCP.cp));
+        statement.addUInt32(honorCP.date);
+        statement.addUInt8(honorCP.type);
+        if (!statement.AppendToCheckedBatch(
+                context.Batch(), SqlAffectedRowsPolicy::ExactlyOne))
+        {
+            context.Invalidate();
+            return false;
+        }
+        acknowledgments.push_back(HonorAck{
+            honorCP.victimType, honorCP.victimId, honorCP.cp,
+            honorCP.date, honorCP.type});
+    }
+
+    context.OnCommit([this, identity, acknowledgments]() {
+        if (!m_owner)
+            return;
+        CharacterIdentitySnapshot current;
+        current.guid = m_owner->GetGUIDLow();
+        current.accountId = m_owner->GetSession()
+            ? m_owner->GetSession()->GetAccountId() : 0;
+        current.canonicalName = m_owner->GetName();
+        current.generation = m_owner->GetIdentityGeneration();
+        if (current.guid != identity.guid ||
+            current.accountId != identity.accountId ||
+            current.canonicalName != identity.canonicalName ||
+            current.generation != identity.generation)
+            return;
+
+        for (HonorCP& honorCP : m_honorCP)
+        {
+            if (honorCP.state != STATE_NEW)
+                continue;
+            for (HonorAck const& ack : acknowledgments)
+            {
+                if (honorCP.victimType == ack.victimType &&
+                    honorCP.victimId == ack.victimId &&
+                    honorCP.cp == ack.cp && honorCP.date == ack.date &&
+                    honorCP.type == ack.type)
+                {
+                    honorCP.state = STATE_UNCHANGED;
+                    break;
+                }
+            }
+        }
+    });
+    return true;
 }
 
 void HonorMgr::SaveStoredData()

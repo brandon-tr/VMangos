@@ -26,6 +26,7 @@
 #include "ObjectAccessor.h"
 
 class Petition;
+class CharacterPersistenceContext;
 
 #define GUILD_EVENTLOG_MAX_RECORDS  100
 #define GUILD_RANKS_MIN_COUNT   5
@@ -266,6 +267,13 @@ class Guild
         int32 GetBackgroundColor() const { return m_BackgroundColor; }
 
         void SetLeader(ObjectGuid guid);
+        /// Deletion-only append/apply seams: SQL is staged into the deletion's
+        /// checked batch, local membership/broadcast effects run after commit.
+        bool AppendDeletionMemberRemoval(
+            CharacterPersistenceContext& context, ObjectGuid guid,
+            struct GuildDeletionMemberPlan& plan);
+        void ApplyDeletionMemberRemoval(
+            struct GuildDeletionMemberPlan const& plan);
         GuildAddStatus AddMember(ObjectGuid plGuid, uint32 plRank, uint32 petitionId = 0);
         bool DelMember(ObjectGuid guid, bool isDisbanding = false);
         //lowest rank is the count of ranks - 1 (the highest rank_id in table)

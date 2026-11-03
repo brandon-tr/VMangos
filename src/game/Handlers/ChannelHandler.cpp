@@ -20,6 +20,7 @@
  */
 
 #include "ObjectMgr.h"                                      // for normalizePlayerName
+#include "PlayerName.h"
 #include "ChannelMgr.h"
 #include "Chat.h"
 #include "World.h"
@@ -94,7 +95,7 @@ void WorldSession::HandleChannelPasswordOpcode(WorldPackets::Channel::ChannelPas
 
 void WorldSession::HandleChannelSetOwnerOpcode(WorldPackets::Channel::ChannelSetOwner const& packet)
 {
-    if (!normalizePlayerName(const_cast<std::string&>(packet.playerName)))
+    if (!normalizeFullPlayerNameForLookup(const_cast<std::string&>(packet.playerName)))
         return;
 
     PlayerPointer player = GetPlayerPointer();
@@ -117,7 +118,7 @@ void WorldSession::HandleChannelOwnerOpcode(WorldPackets::Channel::ChannelOwner 
 
 void WorldSession::HandleChannelModeratorOpcode(WorldPackets::Channel::ChannelModerator const& packet)
 {
-    if (!normalizePlayerName(const_cast<std::string&>(packet.playerName)))
+    if (!normalizeFullPlayerNameForLookup(const_cast<std::string&>(packet.playerName)))
         return;
 
     PlayerPointer player = GetPlayerPointer();
@@ -130,7 +131,7 @@ void WorldSession::HandleChannelModeratorOpcode(WorldPackets::Channel::ChannelMo
 
 void WorldSession::HandleChannelUnmoderatorOpcode(WorldPackets::Channel::ChannelUnmoderator const& packet)
 {
-    if (!normalizePlayerName(const_cast<std::string&>(packet.playerName)))
+    if (!normalizeFullPlayerNameForLookup(const_cast<std::string&>(packet.playerName)))
         return;
 
     PlayerPointer player = GetPlayerPointer();
@@ -143,7 +144,7 @@ void WorldSession::HandleChannelUnmoderatorOpcode(WorldPackets::Channel::Channel
 
 void WorldSession::HandleChannelMuteOpcode(WorldPackets::Channel::ChannelMute const& packet)
 {
-    if (!normalizePlayerName(const_cast<std::string&>(packet.playerName)))
+    if (!normalizeFullPlayerNameForLookup(const_cast<std::string&>(packet.playerName)))
         return;
 
     PlayerPointer player = GetPlayerPointer();
@@ -156,7 +157,7 @@ void WorldSession::HandleChannelMuteOpcode(WorldPackets::Channel::ChannelMute co
 
 void WorldSession::HandleChannelUnmuteOpcode(WorldPackets::Channel::ChannelUnmute const& packet)
 {
-    if (!normalizePlayerName(const_cast<std::string&>(packet.playerName)))
+    if (!normalizeFullPlayerNameForLookup(const_cast<std::string&>(packet.playerName)))
         return;
 
     PlayerPointer player = GetPlayerPointer();
@@ -169,7 +170,7 @@ void WorldSession::HandleChannelUnmuteOpcode(WorldPackets::Channel::ChannelUnmut
 
 void WorldSession::HandleChannelInviteOpcode(WorldPackets::Channel::ChannelInvite const& packet)
 {
-    if (!normalizePlayerName(const_cast<std::string&>(packet.playerName)))
+    if (!normalizeFullPlayerNameForLookup(const_cast<std::string&>(packet.playerName)))
         return;
 
     PlayerPointer player = GetPlayerPointer();
@@ -185,7 +186,7 @@ void WorldSession::HandleChannelInviteOpcode(WorldPackets::Channel::ChannelInvit
 
 void WorldSession::HandleChannelKickOpcode(WorldPackets::Channel::ChannelKick const& packet)
 {
-    if (!normalizePlayerName(const_cast<std::string&>(packet.playerName)))
+    if (!normalizeFullPlayerNameForLookup(const_cast<std::string&>(packet.playerName)))
         return;
 
     PlayerPointer player = GetPlayerPointer();
@@ -198,7 +199,7 @@ void WorldSession::HandleChannelKickOpcode(WorldPackets::Channel::ChannelKick co
 
 void WorldSession::HandleChannelBanOpcode(WorldPackets::Channel::ChannelBan const& packet)
 {
-    if (!normalizePlayerName(const_cast<std::string&>(packet.playerName)))
+    if (!normalizeFullPlayerNameForLookup(const_cast<std::string&>(packet.playerName)))
         return;
 
     PlayerPointer player = GetPlayerPointer();
@@ -211,7 +212,7 @@ void WorldSession::HandleChannelBanOpcode(WorldPackets::Channel::ChannelBan cons
 
 void WorldSession::HandleChannelUnbanOpcode(WorldPackets::Channel::ChannelUnban const& packet)
 {
-    if (!normalizePlayerName(const_cast<std::string&>(packet.playerName)))
+    if (!normalizeFullPlayerNameForLookup(const_cast<std::string&>(packet.playerName)))
         return;
 
     PlayerPointer player = GetPlayerPointer();

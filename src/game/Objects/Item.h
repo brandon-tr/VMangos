@@ -32,6 +32,7 @@ class SpellEntry;
 class Bag;
 class Field;
 class Unit;
+class CharacterPersistenceContext;
 struct ItemRandomPropertiesEntry;
 
 bool ItemCanGoIntoBag(ItemPrototype const* proto, ItemPrototype const* pBagProto);
@@ -59,6 +60,10 @@ class Item : public Object
         bool IsBindedNotWith(Player const* player) const;
         bool IsBoundByEnchant() const;
         virtual void SaveToDB();
+        bool AppendSaveToDB(CharacterPersistenceContext& context,
+                            Player* owner = nullptr);
+        /// Removes this item's character_inventory row inside the given unit.
+        bool AppendInventoryRemovalToDB(CharacterPersistenceContext& context);
         virtual bool LoadFromDB(uint32 guidLow, ObjectGuid ownerGuid, Field* fields, uint32 entry);
         virtual void DeleteFromDB();
         void DeleteFromInventoryDB();
@@ -136,6 +141,10 @@ class Item : public Object
         // Update States
         ItemUpdateState GetState() const { return uState; }
         void SetState(ItemUpdateState state, Player* forplayer = nullptr);
+        // Removes this Item from its owner's update queue before clearing
+        // the dirty state.  Returns false when the queue pointer could not
+        // be detached (owner unavailable/blocked), leaving the Item dirty.
+        bool AcknowledgeSave(Player* owner = nullptr);
         void AddToUpdateQueueOf(Player* player);
         void RemoveFromUpdateQueueOf(Player* player);
         bool IsInUpdateQueue() const { return uQueuePos != -1; }
@@ -159,6 +168,7 @@ class Item : public Object
         static void GetLocalizedNameWithSuffix(std::string& name, ItemPrototype const* proto, ItemRandomPropertiesEntry const* randomProp, int dbLocale, LocaleConstant dbcLocale);
 
     private:
+        friend class Player;
         bool generatedLoot;
         uint8 m_slot;
         Bag* m_container;

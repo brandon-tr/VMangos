@@ -25,6 +25,7 @@
 
 #include "World.h"
 #include "Database/DatabaseEnv.h"
+#include "Database/CharacterNameSchema.h"
 #include "Config/Config.h"
 #include "Platform/Define.h"
 #include "SystemConfig.h"
@@ -37,6 +38,8 @@
 #include "TransactionLog.h"
 #include "Group.h"
 #include "AccountMgr.h"
+#include "Database/CharacterPersistenceRecovery.h"
+#include "Database/SqlPreparedStatement.h"
 #include "AuctionHouseMgr.h"
 #include "ObjectMgr.h"
 #include "CreatureEventAIMgr.h"
@@ -199,20 +202,22 @@ World::~World()
 
 void World::Shutdown()
 {
+    // Stop producers before owner-thread logout/save work, so no producer can
+    // enqueue work against an owner that is being destroyed.
+    if (m_asyncPacketsThread && m_asyncPacketsThread->joinable())
+        m_asyncPacketsThread->join();
+
+    if (m_lfgQueueThread && m_lfgQueueThread->joinable())
+        m_lfgQueueThread->join();
+
+    sAnticheatMgr->StopWardenUpdateThread();
+
     sPlayerBotMgr.DeleteAll();
     KickAll();                                     // save and kick all players
     UpdateSessions(1);                             // real players unload required UpdateSessions call
 
     if (m_charDbWorkerThread && m_charDbWorkerThread->joinable())
         m_charDbWorkerThread->join();
-
-    if (m_lfgQueueThread && m_lfgQueueThread->joinable())
-        m_lfgQueueThread->join();
-
-    if (m_asyncPacketsThread && m_asyncPacketsThread->joinable())
-        m_asyncPacketsThread->join();
-
-    sAnticheatMgr->StopWardenUpdateThread();
 }
 
 /// Find a session by its accountId. Might return nullptr if not found.
@@ -1312,6 +1317,27 @@ void World::SetInitialWorldSettings()
     // Initialize config settings
     LoadConfigSettings();
 
+    // Validate the character-name storage contract before any character load,
+    // cleanup, or cache publication. This never repairs the database.
+    std::string schemaReason;
+    if (!CheckCharacterNameSchema(CharacterDatabase, schemaReason))
+    {
+        sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                 "Character name schema prerequisite failed: %s",
+                 schemaReason.c_str());
+        Log::WaitBeforeContinueIfNeed();
+        exit(1);
+    }
+
+    if (!CheckCharacterNameOwnership(CharacterDatabase, schemaReason))
+    {
+        sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                 "Character name ownership prerequisite failed: %s",
+                 schemaReason.c_str());
+        Log::WaitBeforeContinueIfNeed();
+        exit(1);
+    }
+
     // Check the existence of the map files for all races start areas.
     if (!MapManager::ExistMapAndVMap(0, -6240.32f, 331.033f) ||
             !MapManager::ExistMapAndVMap(0, -8949.95f, -132.493f) ||
@@ -1635,7 +1661,11 @@ void World::SetInitialWorldSettings()
     CharacterDatabaseCleaner::CleanDatabase();
 
     sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "Loading character cache data...");
-    sObjectMgr.LoadPlayerCacheData();
+    if (!sObjectMgr.LoadPlayerCacheData())
+    {
+        Log::WaitBeforeContinueIfNeed();
+        exit(1);
+    }
 
     sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "Loading the max pet number...");
     sObjectMgr.LoadPetNumber();
@@ -2589,7 +2619,7 @@ BanReturn World::BanAccount(BanMode mode, std::string nameOrIP, uint32 duration_
     std::string safe_author = author;
     LoginDatabase.escape_string(safe_author);
 
-    PlayerCacheData const* authorData = sObjectMgr.GetPlayerDataByName(author);
+    PlayerCacheSnapshot authorData = sObjectMgr.GetPlayerDataByName(author);
 
     BanQueryHolder* holder = new BanQueryHolder(mode, nameOrIP, duration_secs, reason, realmID, safe_author,
         authorData ? authorData->uiAccount : 0);
@@ -2888,23 +2918,64 @@ void World::UpdateResultQueue()
     LoginDatabase.ProcessResultQueue(getConfig(CONFIG_UINT32_ASYNC_QUERIES_TICK_TIMEOUT));
 }
 
-void World::UpdateRealmCharCount(uint32 accountId)
+bool World::UpdateRealmCharCount(uint32 accountId,
+                                AccountLifecycleLease const* lease,
+                                uint32* publishedCount)
 {
-    CharacterDatabase.AsyncPQuery(this, &World::_UpdateRealmCharCount, accountId,
-                                  "SELECT COUNT(`guid`) FROM `characters` WHERE `account` = '%u'", accountId);
-}
-
-void World::_UpdateRealmCharCount(std::unique_ptr<QueryResult> resultCharCount, uint32 accountId)
-{
-    if (resultCharCount)
+    if (accountId == 0)
+        return false;
+    AccountLifecycleLeasePtr owned;
+    if (!lease)
     {
-        Field* fields = resultCharCount->Fetch();
-        uint32 charCount = fields[0].GetUInt32();
-
-        LoginDatabase.PExecute("REPLACE INTO `realmcharacters` (`numchars`, `acctid`, `realmid`) VALUES (%u, %u, %u)", charCount, accountId, realmID);
+        owned = GetAccountLifecycleRegistry().TryAcquire(
+            {accountId}, AccountLifecycleKind::Mutation);
+        lease = owned.get();
     }
-}
+    if (!lease || !lease->IsActive() ||
+        !GetAccountLifecycleRegistry().Allows(
+            *lease, accountId, AccountLifecycleKind::Mutation))
+        return false;
 
+    uint32 charCount = 0;
+    if (!sAccountMgr.TryGetCharactersCount(accountId, charCount))
+    {
+        BlockCharacterRecovery(CharacterRecoveryRecord{
+            CharacterRecoveryKind::WholeSave, {}, {accountId}, 0,
+            "realm count publication count read failed"});
+        return false;
+    }
+
+    static SqlStatementID replaceRealmCharacter;
+    SqlCheckedBatch batch = LoginDatabase.CreateCheckedBatch();
+    SqlStatement statement = LoginDatabase.CreateStatement(
+        replaceRealmCharacter,
+        "REPLACE INTO `realmcharacters` (`numchars`, `acctid`, `realmid`) "
+        "VALUES (?, ?, ?)");
+    statement.addUInt32(charCount);
+    statement.addUInt32(accountId);
+    statement.addUInt32(realmID);
+    if (!statement.AppendToCheckedBatch(batch, SqlAffectedRowsPolicy::Any))
+    {
+        BlockCharacterRecovery(CharacterRecoveryRecord{
+            CharacterRecoveryKind::WholeSave, {}, {accountId}, 0,
+            "realm count publication assembly failed"});
+        return false;
+    }
+
+    SqlBatchResult const result =
+        LoginDatabase.DirectExecuteCheckedBatch(std::move(batch));
+    if (result.outcome != SqlWriteOutcome::Succeeded ||
+        result.stage != SqlBatchStage::Complete)
+    {
+        BlockCharacterRecovery(CharacterRecoveryRecord{
+            CharacterRecoveryKind::WholeSave, {}, {accountId}, 0,
+            "realm count publication execution failed"});
+        return false;
+    }
+    if (publishedCount)
+        *publishedCount = charCount;
+    return true;
+}
 void World::SetPlayerLimit(int32 limit, bool needUpdate)
 {
     if (limit < -SEC_ADMINISTRATOR)

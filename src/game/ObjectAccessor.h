@@ -138,7 +138,8 @@ class ObjectAccessor : public MaNGOS::Singleton<ObjectAccessor, MaNGOS::ClassLev
         void RemoveCorpse(Corpse* corpse);
         void AddCorpse(Corpse* corpse);
         void AddCorpsesToGrid(GridPair const& gridpair,GridType& grid,Map const* map);
-        void ConvertCorpseForPlayer(ObjectGuid player_guid, Player const* looter = nullptr);
+        void ConvertCorpseForPlayer(ObjectGuid player_guid, Player const* looter = nullptr,
+                                    bool deleteCorpseRow = true);
         void RemoveOldCorpses();
 
         // For call from Player/Corpse AddToWorld/RemoveFromWorld only

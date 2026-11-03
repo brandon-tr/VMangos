@@ -83,6 +83,8 @@ class LoginQueryHolder;
 class CharacterHandler;
 class MovementInfo;
 class WorldSession;
+class AccountLifecycleLease;
+class CharacterPersistenceContext;
 class Warden;
 class MovementAnticheat;
 class BigNumber;
@@ -208,11 +210,13 @@ class WorldSessionFilter : public PacketFilter
 };
 
 // Player session in the World
+class SqlCheckedBatch;
+
 class WorldSession
 {
     friend class CharacterHandler;
     public:
-        WorldSession(uint32 id, std::shared_ptr<WorldSocket> sock, AccountTypes sec, time_t mute_time, LocaleConstant locale);
+        WorldSession(uint32 id, std::shared_ptr<WorldSocket> sock, AccountTypes sec, time_t mute_time, LocaleConstant locale, uint8 clientRegion = 0);
         ~WorldSession();
 
         uint32 GetGUID() const { return m_guid; }
@@ -300,6 +304,8 @@ class WorldSession
         // Locales
         LocaleConstant GetSessionDbcLocale() const { return m_sessionDbcLocale; }
         int GetSessionDbLocaleIndex() const { return m_sessionDbLocaleIndex; }
+        LocaleConstant GetClientLocale() const { return m_clientLocale; }
+        uint8 GetClientRegion() const { return m_clientRegion; }
         char const* GetMangosString(int32 entry) const;
 
         // Public chat cooldown restriction functionality
@@ -425,6 +431,25 @@ class WorldSession
         void LoadTutorialsData();
         void SendTutorialsData();
         void SaveTutorialsData();
+        bool AppendTutorialsDataToCheckedBatch(SqlCheckedBatch& batch) const;
+        struct CharacterRenameRequest
+        {
+            uint32 guid = 0;
+            std::string newName;
+            std::shared_ptr<AccountLifecycleLease> lease;
+        };
+        struct LoginAdmissionRequest
+        {
+            uint32 sessionGuid = 0;
+            std::shared_ptr<AccountLifecycleLease> lease;
+            std::shared_ptr<LoginQueryHolder> holder;
+        };
+        static void HandleChangePlayerNameOpcodeCallBack(
+            std::unique_ptr<QueryResult> result, uint32 accountId,
+            uint32 sessionGuid, CharacterRenameRequest request);
+        bool AppendTutorialsDataToContext(
+            CharacterPersistenceContext& context);
+        void MarkTutorialsDataSaved();
         uint32 GetTutorialInt(uint32 intId) const;
         void SetTutorialInt(uint32 intId, uint32 value)
         {
@@ -497,7 +522,8 @@ class WorldSession
         void HandleCharDeleteOpcode(WorldPackets::Character::CharDelete const& packet);
         void HandlePlayerLoginOpcode(WorldPackets::Character::PlayerLogin const& packet);
         void HandleCharEnum(std::unique_ptr<QueryResult> result);
-        void HandlePlayerLogin(LoginQueryHolder* holder);
+        void HandlePlayerLogin(std::shared_ptr<LoginQueryHolder> holder,
+            std::shared_ptr<AccountLifecycleLease> lease = nullptr);
         void HandlePlayedTime(NullClientPacket const& packet);
 
         // Movement
@@ -810,7 +836,6 @@ class WorldSession
 #endif
 
         void HandleCharRenameOpcode(WorldPackets::Character::CharRename const& packet);
-        static void HandleChangePlayerNameOpcodeCallBack(std::unique_ptr<QueryResult> result, uint32 accountId, std::string newname);
 
         //BattleGround
         void HandleBattlefieldJoinOpcode(WorldPackets::Battleground::BattlefieldJoin const& packet);
@@ -871,6 +896,8 @@ class WorldSession
         uint32 m_accountFlags;
         LocaleConstant m_sessionDbcLocale;
         int m_sessionDbLocaleIndex;
+        LocaleConstant m_clientLocale;
+        uint8 m_clientRegion;
         ClientOSType m_clientOS;
         ClientPlatformType m_clientPlatform;
         uint32 m_gameBuild;

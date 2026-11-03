@@ -17,8 +17,11 @@
  */
 
 #include "DatabaseEnv.h"
+#include "Database/SqlCheckedBatch.h"
 #include "Log.h"
 #include "Errors.h"
+#include <memory>
+#include <utility>
 
 bool SqlStmtFieldData::toBool() const { MANGOS_ASSERT(m_type == FIELD_BOOL); return m_binaryData.boolean; }
 uint8 SqlStmtFieldData::toUint8() const { MANGOS_ASSERT(m_type == FIELD_UI8); return m_binaryData.ui8; }
@@ -99,6 +102,52 @@ bool SqlStatement::DirectExecute()
     }
 
     return m_pDB->DirectExecuteStmt(m_index, args);
+}
+
+SqlWriteResult SqlStatement::DirectExecuteChecked()
+{
+    SqlWriteResult notExecuted = {SqlWriteOutcome::NotExecuted, 0, 0};
+    std::unique_ptr<SqlStmtParameters> args(detach());
+    if (!m_pDB || args->boundParams() != arguments())
+        return notExecuted;
+
+    std::string const& sql = m_pDB->GetStmtString(ID());
+    if (sql.empty() || sql.find('\0') != std::string::npos)
+        return notExecuted;
+
+    return m_pDB->DirectExecutePreparedChecked(sql, args->params());
+}
+
+bool SqlStatement::AppendToCheckedBatch(SqlCheckedBatch& batch,
+                                        SqlAffectedRowsPolicy policy)
+{
+    if (!m_pDB || batch.GetDatabase() != m_pDB ||
+        (policy != SqlAffectedRowsPolicy::Any &&
+         policy != SqlAffectedRowsPolicy::ExactlyOne))
+        return false;
+
+    int const bound = m_pParams ? m_pParams->boundParams() : 0;
+    if (bound != arguments())
+        return false;
+
+    std::string const& sql = m_pDB->GetStmtString(ID());
+    if (sql.empty() || sql.find('\0') != std::string::npos)
+        return false;
+
+    std::vector<SqlStmtFieldData> parameters;
+    if (m_pParams)
+        parameters = m_pParams->params();
+
+    if (!batch.Append(sql, std::move(parameters), policy))
+        return false;
+
+    std::unique_ptr<SqlStmtParameters> consumed(detach());
+    return true;
+}
+
+bool SqlStatement::AppendToCheckedBatch(SqlCheckedBatch& batch)
+{
+    return AppendToCheckedBatch(batch, SqlAffectedRowsPolicy::Any);
 }
 
 //////////////////////////////////////////////////////////////////////////

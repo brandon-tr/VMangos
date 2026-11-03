@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright (C) 2005-2011 MaNGOS <http://getmangos.com/>
  * Copyright (C) 2009-2011 MaNGOSZero <https://github.com/mangos/zero>
  * Copyright (C) 2011-2016 Nostalrius <https://nostalrius.org>
@@ -26,6 +26,7 @@
 #include "World.h"
 #include "Opcodes.h"
 #include "ObjectMgr.h"
+#include "PlayerName.h"
 #include "Chat.h"
 #include "Database/DatabaseEnv.h"
 #include "ChannelMgr.h"
@@ -397,7 +398,7 @@ void WorldSession::HandleChatMessageOpcode(WorldPackets::Chat::ChatMessage const
 
         case CHAT_MSG_WHISPER: // Master Side
         {
-            if (!normalizePlayerName(const_cast<std::string&>(packet.whisperTargetOrChannel)))
+            if (!normalizeFullPlayerNameForLookup(const_cast<std::string&>(packet.whisperTargetOrChannel)))
             {
                 SendPlayerNotFoundNotice(packet.whisperTargetOrChannel);
                 break;

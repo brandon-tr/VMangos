@@ -22,6 +22,9 @@
 #include "AccountMgr.h"
 #include "Database/DatabaseEnv.h"
 #include "Database/DatabaseImpl.h"
+#include "Database/CharacterIdentityPersistence.h"
+#include "Database/CharacterPersistenceRecovery.h"
+#include "Database/SqlPreparedStatement.h"
 #include "ObjectAccessor.h"
 #include "ObjectGuid.h"
 #include "Player.h"
@@ -33,6 +36,9 @@
 #include "Anticheat.h"
 #include "Crypto/Authentication/SRP6.h"
 #include "Crypto/Hash/SHA1.h"
+
+#include <limits>
+#include <vector>
 
 INSTANTIATE_SINGLETON_1(AccountMgr);
 
@@ -72,46 +78,220 @@ AccountOpResult AccountMgr::CreateAccount(std::string username, std::string pass
     return AOR_OK;                                          // everything's fine
 }
 
-AccountOpResult AccountMgr::DeleteAccount(uint32 accid)
+static bool ParseAccountDeletionCount(char const* text, uint64& value)
 {
-    std::unique_ptr<QueryResult> result = LoginDatabase.PQuery("SELECT 1 FROM `account` WHERE `id`='%u'", accid);
-    if (!result)
-        return AOR_NAME_NOT_EXIST;                          // account doesn't exist
-
-    // existing characters list
-    result = CharacterDatabase.PQuery("SELECT `guid` FROM `characters` WHERE `account`='%u'", accid);
-    if (result)
+    if (!text || !*text)
+        return false;
+    uint64 parsed = 0;
+    for (char const* it = text; *it; ++it)
     {
-        do
-        {
-            Field* fields = result->Fetch();
-            uint32 guidlo = fields[0].GetUInt32();
-            ObjectGuid guid = ObjectGuid(HIGHGUID_PLAYER, guidlo);
-
-            // kick if player currently
-            ObjectAccessor::KickPlayer(guid);
-            Player::DeleteFromDB(guid, accid, false);       // no need to update realm characters
-        }
-        while (result->NextRow());
+        if (*it < '0' || *it > '9')
+            return false;
+        uint64 const digit = uint64(*it - '0');
+        if (parsed > (std::numeric_limits<uint64>::max() - digit) / 10)
+            return false;
+        parsed = parsed * 10 + digit;
     }
-
-    // table realm specific but common for all characters of account for realm
-    CharacterDatabase.PExecute("DELETE FROM `character_tutorial` WHERE `account` = '%u'", accid);
-
-    LoginDatabase.BeginTransaction();
-
-    bool res =
-        LoginDatabase.PExecute("DELETE FROM `account` WHERE `id`='%u'", accid) &&
-        LoginDatabase.PExecute("DELETE FROM `realmcharacters` WHERE `acctid`='%u'", accid);
-
-    LoginDatabase.CommitTransaction();
-
-    if (!res)
-        return AOR_DB_INTERNAL_ERROR;                       // unexpected error;
-
-    return AOR_OK;
+    value = parsed;
+    return true;
 }
 
+AccountOpResult AccountMgr::DeleteAccount(uint32 accid)
+{
+    if (accid == 0)
+        return AOR_DB_INTERNAL_ERROR;
+    AccountLifecycleLeasePtr admission =
+        GetAccountLifecycleRegistry().TryAcquire(
+            {accid}, AccountLifecycleKind::Deletion);
+    if (!admission)
+        return AOR_DB_INTERNAL_ERROR;
+    if (IsAccountRecoveryBlocked(accid))
+        return AOR_DB_INTERNAL_ERROR;
+
+    bool deletionAttempted = false;
+    bool cleanupCommitted = false;
+    auto fail = [&](bool mustRecover, char const* why) {
+        if (mustRecover)
+            BlockCharacterRecovery(CharacterRecoveryRecord{
+                CharacterRecoveryKind::AccountDeletion, {}, {accid}, 0, why});
+        return AOR_DB_INTERNAL_ERROR;
+    };
+
+    std::unique_ptr<QueryResult> account = LoginDatabase.PQuery(
+        "SELECT COUNT(*) FROM `account` WHERE `id`='%u'", accid);
+    if (!account)
+        return AOR_DB_INTERNAL_ERROR;
+    Field* accountFields = account->Fetch();
+    if (!accountFields)
+        return AOR_DB_INTERNAL_ERROR;
+    uint64 accountCount = 0;
+    if (!ParseAccountDeletionCount(accountFields[0].GetString(), accountCount))
+        return AOR_DB_INTERNAL_ERROR;
+    if (accountCount == 0)
+        return AOR_NAME_NOT_EXIST;
+
+    std::unique_ptr<QueryResult> characterCountResult = CharacterDatabase.PQuery(
+        "SELECT COUNT(*) FROM `characters` "
+        "WHERE `account`='%u' OR `deleted_account`='%u'", accid, accid);
+    if (!characterCountResult)
+        return AOR_DB_INTERNAL_ERROR;
+    Field* characterCountFields = characterCountResult->Fetch();
+    if (!characterCountFields)
+        return AOR_DB_INTERNAL_ERROR;
+    uint64 expectedCharacters = 0;
+    if (!ParseAccountDeletionCount(characterCountFields[0].GetString(),
+                                   expectedCharacters))
+        return AOR_DB_INTERNAL_ERROR;
+
+    std::vector<CharacterDeletionSnapshot> snapshots;
+    if (expectedCharacters > 0)
+    {
+        std::unique_ptr<QueryResult> characters = CharacterDatabase.PQuery(
+            "SELECT `guid`, `account`, `name`, `identity_generation`, "
+            "IFNULL(`deleted_time`,0), `deleted_account`, `deleted_name` "
+            "FROM `characters` WHERE `account`='%u' OR `deleted_account`='%u'",
+            accid, accid);
+        if (!characters || characters->GetRowCount() != expectedCharacters)
+            return AOR_DB_INTERNAL_ERROR;
+
+        snapshots.reserve(static_cast<std::size_t>(expectedCharacters));
+        do
+        {
+            Field* fields = characters->Fetch();
+            if (!fields)
+                return AOR_DB_INTERNAL_ERROR;
+            CharacterDeletionSnapshot snapshot;
+            snapshot.identity.guid = fields[0].GetUInt32();
+            snapshot.deletedTime = fields[4].GetUInt64();
+            snapshot.identity.generation = fields[3].GetUInt64();
+            if (snapshot.deletedTime == 0)
+            {
+                snapshot.identity.accountId = fields[1].GetUInt32();
+                snapshot.identity.canonicalName = fields[2].GetCppString();
+            }
+            else
+            {
+                snapshot.identity.accountId = fields[5].GetUInt32();
+                snapshot.identity.canonicalName = fields[6].GetCppString();
+            }
+            if (snapshot.identity.accountId != accid ||
+                snapshot.identity.guid == 0)
+                return AOR_DB_INTERNAL_ERROR;
+            snapshots.push_back(snapshot);
+        }
+        while (characters->NextRow());
+    }
+    if (snapshots.size() != expectedCharacters)
+        return AOR_DB_INTERNAL_ERROR;
+
+    for (CharacterDeletionSnapshot const& snapshot : snapshots)
+    {
+        ObjectGuid guid = ObjectGuid(HIGHGUID_PLAYER, snapshot.identity.guid);
+        ObjectAccessor::KickPlayer(guid);
+        // DeleteFromDB may commit cleanup before reporting failure, so any
+        // dispatch requires recovery regardless of its bool result.
+        deletionAttempted = true;
+        if (!Player::DeleteFromDB(guid, accid, false, true, &snapshot,
+                                 admission.get()))
+        {
+            sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                     "Account deletion stopped: character guid %u could not be deleted",
+                     snapshot.identity.guid);
+            return fail(true, "character deletion reported failure after dispatch");
+        }
+    }
+
+    std::unique_ptr<QueryResult> remaining = CharacterDatabase.PQuery(
+        "SELECT COUNT(*) FROM `characters` "
+        "WHERE `account`='%u' OR `deleted_account`='%u'", accid, accid);
+    if (!remaining)
+        return fail(deletionAttempted || cleanupCommitted,
+                    "remaining character count query failed after cleanup");
+    Field* remainingFields = remaining->Fetch();
+    if (!remainingFields)
+        return fail(deletionAttempted || cleanupCommitted,
+                    "remaining character count row missing after cleanup");
+    uint64 remainingCount = 0;
+    if (!ParseAccountDeletionCount(remainingFields[0].GetString(), remainingCount) ||
+        remainingCount != 0)
+        return fail(deletionAttempted || cleanupCommitted,
+                    "remaining character count invalid or nonzero");
+    // Character-side finalization. Login work starts only after this commits.
+    CharacterPersistenceContext characterContext(CharacterDatabase, accid);
+    static SqlStatementID deleteTutorial;
+    SqlStatement tutorial = CharacterDatabase.CreateStatement(
+        deleteTutorial,
+        "DELETE FROM `character_tutorial` WHERE `account`=?");
+    tutorial.addUInt32(accid);
+    if (!tutorial.AppendToCheckedBatch(
+            characterContext.Batch(), SqlAffectedRowsPolicy::Any))
+        return fail(deletionAttempted || cleanupCommitted,
+                    "tutorial cleanup assembly failed after cleanup");
+    SqlBatchResult const characterResult = characterContext.Execute();
+    if (characterResult.outcome != SqlWriteOutcome::Succeeded ||
+        characterResult.stage != SqlBatchStage::Complete)
+    {
+        bool const unknown =
+            characterResult.outcome == SqlWriteOutcome::OutcomeUnknown;
+        if (unknown)
+        {
+            BlockCharacterRecovery(CharacterRecoveryRecord{
+                CharacterRecoveryKind::AccountDeletion, {}, {accid}, 0,
+                "account character-side finalization outcome unknown"});
+        }
+        sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                 "Account deletion character-side finalization failed for account %u "
+                 "(stage %u, stmt %zu)", accid,
+                 uint32(characterResult.stage), characterResult.statementIndex);
+        if (unknown)
+            return AOR_DB_INTERNAL_ERROR;
+        return fail(deletionAttempted || cleanupCommitted,
+                    "tutorial cleanup failed after earlier cleanup");
+    }
+    cleanupCommitted = true;
+
+    CharacterPersistenceContext loginContext(LoginDatabase, accid);
+    static SqlStatementID deleteRealmCharacters;
+    SqlStatement realmCharacters = LoginDatabase.CreateStatement(
+        deleteRealmCharacters,
+        "DELETE FROM `realmcharacters` WHERE `acctid`=?");
+    realmCharacters.addUInt32(accid);
+    if (!realmCharacters.AppendToCheckedBatch(
+            loginContext.Batch(), SqlAffectedRowsPolicy::Any))
+        return fail(true, "realm-character cleanup assembly failed after tutorial commit");
+
+    static SqlStatementID deleteAccount;
+    SqlStatement accountDelete = LoginDatabase.CreateStatement(
+        deleteAccount, "DELETE FROM `account` WHERE `id`=?");
+    accountDelete.addUInt32(accid);
+    if (!accountDelete.AppendToCheckedBatch(
+            loginContext.Batch(), SqlAffectedRowsPolicy::ExactlyOne))
+        return fail(true, "account deletion assembly failed after tutorial commit");
+
+    SqlBatchResult const loginResult = loginContext.Execute();
+    if (loginResult.outcome != SqlWriteOutcome::Succeeded ||
+        loginResult.stage != SqlBatchStage::Complete)
+    {
+        // Character-side work has committed. Do not roll it back or recreate characters.
+        BlockCharacterRecovery(CharacterRecoveryRecord{
+            CharacterRecoveryKind::AccountDeletion, {}, {accid}, 0,
+            "login finalization failed after character-side commit"});
+        sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                 "Account deletion login finalization failed for account %u after "
+                 "character-side commit (stage %u, stmt %zu)", accid,
+                 uint32(loginResult.stage), loginResult.statementIndex);
+        return AOR_DB_INTERNAL_ERROR;
+    }
+
+    if (!GetAccountLifecycleRegistry().MarkDeleted(*admission, accid))
+    {
+        BlockCharacterRecovery(CharacterRecoveryRecord{
+            CharacterRecoveryKind::AccountDeletion, {}, {accid}, 0,
+            "login account deleted but retirement marking failed"});
+        return AOR_DB_INTERNAL_ERROR;
+    }
+    return AOR_OK;
+}
 //#DEPRECATED: Not used anywhere, should we delete?
 AccountOpResult AccountMgr::ChangeUsername(uint32 accid, std::string new_uname, std::string new_passwd)
 {
@@ -249,16 +429,27 @@ bool AccountMgr::GetName(uint32 accountId, std::string &name)
 
 uint32 AccountMgr::GetCharactersCount(uint32 acc_id)
 {
-    // check character count
-    std::unique_ptr<QueryResult> result = CharacterDatabase.PQuery("SELECT COUNT(`guid`) FROM `characters` WHERE `account` = '%u'", acc_id);
-    if (result)
-    {
-        Field* fields = result->Fetch();
-        uint32 charcount = fields[0].GetUInt32();
-        return charcount;
-    }
-    else
-        return 0;
+    uint32 count = 0;
+    return TryGetCharactersCount(acc_id, count) ? count : 0;
+}
+
+bool AccountMgr::TryGetCharactersCount(uint32 acc_id, uint32& count)
+{
+    if (acc_id == 0)
+        return false;
+    std::unique_ptr<QueryResult> result = CharacterDatabase.PQuery(
+        "SELECT COUNT(`guid`) FROM `characters` WHERE `account` = '%u'", acc_id);
+    if (!result)
+        return false;
+    Field* fields = result->Fetch();
+    if (!fields)
+        return false;
+    uint64 parsed = 0;
+    if (!ParseAccountDeletionCount(fields[0].GetString(), parsed) ||
+        parsed > std::numeric_limits<uint32>::max())
+        return false;
+    count = static_cast<uint32>(parsed);
+    return true;
 }
 
 bool AccountMgr::CheckPassword(uint32 accid, std::string passwd, std::string username)

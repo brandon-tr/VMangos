@@ -107,6 +107,7 @@ class AccountMgr
         void SetSecurity(uint32 accountId, AccountTypes security);
         bool GetName(uint32 accountId, std::string &name);
         uint32 GetCharactersCount(uint32 acc_id);
+        bool TryGetCharactersCount(uint32 acc_id, uint32& count);
         bool HasTrialRestrictions(uint32 accountId);
 
         static bool normalizeString(std::string& utf8str);

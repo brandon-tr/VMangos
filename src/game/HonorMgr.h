@@ -7,6 +7,9 @@
 
 #include <unordered_map>
 
+class Player;
+class CharacterPersistenceContext;
+
 struct HonorScores
 {
     float FX[15];
@@ -158,6 +161,7 @@ class HonorMgr
         ~HonorMgr() {}
 
         void Save();
+        bool AppendSaveToDB(CharacterPersistenceContext& context);
         void SaveStoredData();
         void Load(std::unique_ptr<QueryResult> result);
 

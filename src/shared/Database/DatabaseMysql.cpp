@@ -27,6 +27,7 @@
 #include "Policies/SingletonImp.h"
 #include "Platform/Define.h"
 #include "DatabaseEnv.h"
+#include "Database/SqlPreparedWrite.h"
 #include "Timer.h"
 
 size_t DatabaseMysql::db_count = 0;
@@ -296,8 +297,33 @@ bool MySQLConnection::Execute(std::string const& sql)
     return true;
 }
 
+SqlWriteResult MySQLConnection::ExecuteChecked(std::string const& sql)
+{
+    return ExecuteMySQLWrite(mMysql, sql);
+}
+
+SqlWriteResult MySQLConnection::ExecutePreparedChecked(
+    std::string const& sql,
+    std::vector<SqlStmtFieldData> const& parameters)
+{
+    return ExecuteMySQLPreparedWrite(mMysql, sql, parameters);
+}
+
+void MySQLConnection::DiscardConnection()
+{
+    FreePreparedStatements();
+    if (mMysql)
+    {
+        mysql_close(mMysql);
+        mMysql = nullptr;
+    }
+}
+
 bool MySQLConnection::_TransactionCmd(std::string const& sql)
 {
+    if (!mMysql)
+        return false;
+
     if (mysql_query(mMysql, sql.c_str()))
     {
         sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "SQL: %s", sql.c_str());
@@ -453,17 +479,7 @@ void MySqlPreparedStatement::addParam(int nIndex, SqlStmtFieldData const& data)
     MANGOS_ASSERT(m_pInputArgs);
     MANGOS_ASSERT(nIndex < static_cast <int32> (m_nParams));
 
-    MYSQL_BIND& pData = m_pInputArgs[nIndex];
-
-    my_bool bUnsigned = 0;
-    enum_field_types dataType = ToMySQLType(data, bUnsigned);
-
-    //setup MYSQL_BIND structure
-    pData.buffer_type = dataType;
-    pData.is_unsigned = bUnsigned;
-    pData.buffer = data.buff();
-    pData.length = 0;
-    pData.buffer_length = data.type() == FIELD_STRING ? data.size() : 0;
+    BindMySQLWriteParameter(m_pInputArgs[nIndex], data);
 }
 
 void MySqlPreparedStatement::RemoveBinds()
@@ -498,29 +514,4 @@ bool MySqlPreparedStatement::execute()
     }
 
     return true;
-}
-
-enum_field_types MySqlPreparedStatement::ToMySQLType(SqlStmtFieldData const& data, my_bool& bUnsigned)
-{
-    bUnsigned = 0;
-    enum_field_types dataType = MYSQL_TYPE_NULL;
-
-    switch (data.type())
-    {
-    case FIELD_NONE:    dataType = MYSQL_TYPE_NULL;                     break;
-    case FIELD_BOOL:    dataType = MYSQL_TYPE_BIT;      bUnsigned = 1;  break;
-    case FIELD_I8:      dataType = MYSQL_TYPE_TINY;                     break;
-    case FIELD_UI8:     dataType = MYSQL_TYPE_TINY;     bUnsigned = 1;  break;
-    case FIELD_I16:     dataType = MYSQL_TYPE_SHORT;                    break;
-    case FIELD_UI16:    dataType = MYSQL_TYPE_SHORT;    bUnsigned = 1;  break;
-    case FIELD_I32:     dataType = MYSQL_TYPE_LONG;                     break;
-    case FIELD_UI32:    dataType = MYSQL_TYPE_LONG;     bUnsigned = 1;  break;
-    case FIELD_I64:     dataType = MYSQL_TYPE_LONGLONG;                 break;
-    case FIELD_UI64:    dataType = MYSQL_TYPE_LONGLONG; bUnsigned = 1;  break;
-    case FIELD_FLOAT:   dataType = MYSQL_TYPE_FLOAT;                    break;
-    case FIELD_DOUBLE:  dataType = MYSQL_TYPE_DOUBLE;                   break;
-    case FIELD_STRING:  dataType = MYSQL_TYPE_STRING;                   break;
-    }
-
-    return dataType;
 }

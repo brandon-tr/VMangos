@@ -55,7 +55,7 @@ void SqlDelayThread::run()
     auto lastAliveCheck = Clock::now();
     auto aliveCheckInterval = std::chrono::milliseconds(m_dbEngine->GetPingIntervalMs());
 
-    while (m_running)
+    while (m_running.load())
     {
         // if the running state gets turned off while sleeping
         // empty the queue before exiting
@@ -72,12 +72,17 @@ void SqlDelayThread::run()
         }
     }
 
+    // Drain work accepted before Stop became visible. The destructor performs
+    // a second drain for anything added after this point, preserving exactly-once
+    // execution because both use the same queue's next() removal.
+    ProcessRequests();
+
     mysql_thread_end();
 }
 
 void SqlDelayThread::Stop()
 {
-    m_running = false;
+    m_running.store(false);
 }
 
 void SqlDelayThread::ProcessRequests()

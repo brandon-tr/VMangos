@@ -483,6 +483,12 @@ struct NamesProfanityEntry
     char const* Name;                                       // 1
 };
 
+struct ChatProfanityEntry
+{
+    //uint32    ID;                                         // 0
+    char const* Name;                                       // 1
+};
+
 struct NamesReservedEntry
 {
     //uint32    ID;                                         // 0

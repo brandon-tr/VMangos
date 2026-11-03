@@ -24,6 +24,7 @@
 #include "WorldSession.h"
 #include "World.h"
 #include "ObjectMgr.h"
+#include "PlayerName.h"
 #include "Log.h"
 #include "Opcodes.h"
 #include "Guild.h"
@@ -74,7 +75,7 @@ void WorldSession::HandleGuildCreateOpcode(WorldPackets::Guild::GuildCreate cons
 void WorldSession::HandleGuildInviteOpcode(WorldPackets::Guild::GuildInvite const& packet)
 {
     Player* player = nullptr;
-    if (normalizePlayerName(const_cast<std::string&>(packet.invitedName)))
+    if (normalizeFullPlayerNameForLookup(const_cast<std::string&>(packet.invitedName)))
         player = ObjectAccessor::FindPlayerByName(packet.invitedName.c_str());
 
     if (!player)
@@ -142,7 +143,7 @@ void WorldSession::HandleGuildInviteOpcode(WorldPackets::Guild::GuildInvite cons
 
 void WorldSession::HandleGuildRemoveOpcode(WorldPackets::Guild::GuildRemove const& packet)
 {
-    if (!normalizePlayerName(const_cast<std::string&>(packet.playerName)))
+    if (!normalizeFullPlayerNameForLookup(const_cast<std::string&>(packet.playerName)))
         return;
 
     Player* player = GetPlayer();
@@ -266,7 +267,7 @@ void WorldSession::HandleGuildRosterOpcode(NullClientPacket const& /*packet*/)
 
 void WorldSession::HandleGuildPromoteOpcode(WorldPackets::Guild::GuildPromote const& packet)
 {
-    if (!normalizePlayerName(const_cast<std::string&>(packet.playerName)))
+    if (!normalizeFullPlayerNameForLookup(const_cast<std::string&>(packet.playerName)))
         return;
 
     Guild* guild = sGuildMgr.GetGuildById(GetPlayer()->GetGuildId());
@@ -314,7 +315,7 @@ void WorldSession::HandleGuildPromoteOpcode(WorldPackets::Guild::GuildPromote co
 
 void WorldSession::HandleGuildDemoteOpcode(WorldPackets::Guild::GuildDemote const& packet)
 {
-    if (!normalizePlayerName(const_cast<std::string&>(packet.playerName)))
+    if (!normalizeFullPlayerNameForLookup(const_cast<std::string&>(packet.playerName)))
         return;
 
     Guild* guild = sGuildMgr.GetGuildById(GetPlayer()->GetGuildId());
@@ -428,7 +429,7 @@ void WorldSession::HandleGuildLeaderOpcode(WorldPackets::Guild::GuildLeader cons
 {
     Player* oldLeader = GetPlayer();
 
-    if (!normalizePlayerName(const_cast<std::string&>(packet.playerName)))
+    if (!normalizeFullPlayerNameForLookup(const_cast<std::string&>(packet.playerName)))
         return;
 
     Guild* guild = sGuildMgr.GetGuildById(oldLeader->GetGuildId());
@@ -491,7 +492,7 @@ void WorldSession::HandleGuildMOTDOpcode(WorldPackets::Guild::GuildMOTD const& p
 
 void WorldSession::HandleGuildSetPublicNoteOpcode(WorldPackets::Guild::GuildSetPublicNote const& packet)
 {
-    if (!normalizePlayerName(const_cast<std::string&>(packet.playerName)))
+    if (!normalizeFullPlayerNameForLookup(const_cast<std::string&>(packet.playerName)))
         return;
 
     Guild* guild = sGuildMgr.GetGuildById(GetPlayer()->GetGuildId());
@@ -528,7 +529,7 @@ void WorldSession::HandleGuildSetPublicNoteOpcode(WorldPackets::Guild::GuildSetP
 
 void WorldSession::HandleGuildSetOfficerNoteOpcode(WorldPackets::Guild::GuildSetOfficerNote const& packet)
 {
-    if (!normalizePlayerName(const_cast<std::string&>(packet.playerName)))
+    if (!normalizeFullPlayerNameForLookup(const_cast<std::string&>(packet.playerName)))
         return;
 
     Guild* guild = sGuildMgr.GetGuildById(GetPlayer()->GetGuildId());

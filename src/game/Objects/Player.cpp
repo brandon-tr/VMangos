@@ -27,6 +27,10 @@
 #include "Bag.h"
 #include "Language.h"
 #include "Database/DatabaseEnv.h"
+#include "Database/CharacterIdentityPersistence.h"
+#include "Database/CharacterDeletionRelationships.h"
+#include "Database/CharacterPersistenceRecovery.h"
+#include <limits>
 #include "Log.h"
 #include "Opcodes.h"
 #include "SpellMgr.h"
@@ -47,6 +51,7 @@
 #include "CellImpl.h"
 #include "ObjectMgr.h"
 #include "ObjectAccessor.h"
+#include "PlayerName.h"
 #include "Formulas.h"
 #include "Group.h"
 #include "Guild.h"
@@ -109,7 +114,7 @@ static uint32 copseReclaimDelay[MAX_DEATH_COUNT] = { 30, 60, 120 };
 
 Player::Player(WorldSession* session) : Unit(),
     m_mover(this), m_camera(this), m_reputationMgr(this), m_saveDisabled(false), m_enableInstanceSwitch(true),
-    m_currentTicketCounter(0), m_repopAtGraveyardPending(false), m_knownLanguagesMask(0),
+    m_currentTicketCounter(0), m_repopAtGraveyardPending(false), m_knownLanguagesMask(0), m_identityGeneration(0),
     m_honorMgr(this), m_personalXpRate(-1.0f), m_isStandUpScheduled(false)
 {
     m_objectType |= TYPEMASK_PLAYER;
@@ -4311,187 +4316,233 @@ TrainerSpellState Player::GetTrainerSpellState(TrainerSpell const* pTrainerSpell
  * @param updateRealmChars when this flag is set, the amount of characters on that realm will be updated in the realmlist
  * @param deleteFinally    if this flag is set, the config option will be ignored and the character will be permanently removed from the database
  */
-void Player::DeleteFromDB(ObjectGuid playerGuid, uint32 accountId, bool updateRealmChars, bool deleteFinally)
+static bool ParseDeletionCount(char const* text, uint64& value)
 {
-    // for nonexistent account avoid update realm
-    if (accountId == 0)
-        updateRealmChars = false;
+    if (!text || !*text)
+        return false;
+    uint64 parsed = 0;
+    for (char const* it = text; *it; ++it)
+    {
+        if (*it < '0' || *it > '9')
+            return false;
+        uint64 const digit = uint64(*it - '0');
+        if (parsed > (std::numeric_limits<uint64>::max() - digit) / 10)
+            return false;
+        parsed = parsed * 10 + digit;
+    }
+    value = parsed;
+    return true;
+}
+
+bool Player::DeleteFromDB(ObjectGuid playerGuid, uint32 accountId, bool updateRealmChars, bool deleteFinally, CharacterDeletionSnapshot const* expected, AccountLifecycleLease const* lease)
+{
+    uint32 const lowGuid = playerGuid.GetCounter();
+    if (lowGuid == 0 || accountId == 0)
+        return false;
+
+    AccountLifecycleLeasePtr ownedLease;
+    if (!lease)
+    {
+        ownedLease = GetAccountLifecycleRegistry().TryAcquire(
+            {accountId}, AccountLifecycleKind::Mutation);
+        lease = ownedLease.get();
+    }
+    if (!lease || !lease->IsActive() || !lease->Covers(accountId) ||
+        !GetAccountLifecycleRegistry().Allows(
+            *lease, accountId, lease->GetKind()))
+        return false;
+    if (updateRealmChars &&
+        lease->GetKind() != AccountLifecycleKind::Mutation)
+        return false;
+
+    CharacterDeletionSnapshot snapshot;
+    if (expected)
+    {
+        snapshot = *expected;
+        if (snapshot.identity.guid != lowGuid ||
+            snapshot.identity.accountId != accountId)
+            return false;
+    }
+    else
+    {
+        std::unique_ptr<QueryResult> identity = CharacterDatabase.PQuery(
+            "SELECT `account`, `name`, `identity_generation`, "
+            "IFNULL(`deleted_time`,0), `deleted_account`, `deleted_name` "
+            "FROM `characters` WHERE `guid`='%u'", lowGuid);
+        if (!identity)
+            return false;
+        Field* fields = identity->Fetch();
+        if (!fields)
+            return false;
+
+        uint64 const deletedTime = fields[3].GetUInt64();
+        snapshot.deletedTime = deletedTime;
+        snapshot.identity.guid = lowGuid;
+        snapshot.identity.generation = fields[2].GetUInt64();
+        if (deletedTime == 0)
+        {
+            snapshot.identity.accountId = fields[0].GetUInt32();
+            snapshot.identity.canonicalName = fields[1].GetCppString();
+            if (fields[0].GetUInt32() != accountId ||
+                snapshot.identity.canonicalName.empty())
+                return false;
+        }
+        else
+        {
+            snapshot.identity.accountId = fields[4].GetUInt32();
+            snapshot.identity.canonicalName = fields[5].GetCppString();
+            if (fields[0].GetUInt32() != 0 || !fields[1].GetCppString().empty() ||
+                snapshot.identity.accountId != accountId ||
+                snapshot.identity.canonicalName.empty())
+                return false;
+        }
+    }
+
+    if (snapshot.identity.generation == 0 ||
+        snapshot.identity.generation == std::numeric_limits<uint64>::max() ||
+        !isCanonicalFullPlayerName(snapshot.identity.canonicalName) ||
+        IsCharacterRecoveryBlocked(lowGuid) ||
+        IsAccountRecoveryBlocked(snapshot.identity.accountId))
+        return false;
 
     uint32 charDelete_method = sWorld.getConfig(CONFIG_UINT32_CHARDELETE_METHOD);
     uint32 charDelete_minLvl = sWorld.getConfig(CONFIG_UINT32_CHARDELETE_MIN_LEVEL);
 
-    // if we want to finally delete the character or the character does not meet the level requirement, we set it to mode 0
-    if (deleteFinally)
+    if (snapshot.deletedTime != 0 || deleteFinally)
         charDelete_method = 0;
     else
     {
-        PlayerCacheData const* data = sObjectMgr.GetPlayerDataByGUID(playerGuid);
+        PlayerCacheSnapshot data = sObjectMgr.GetPlayerDataByGUID(playerGuid);
         if (data && data->uiLevel < charDelete_minLvl)
             charDelete_method = 0;
     }
 
-    uint32 lowGuid = playerGuid.GetCounter();
-
-    // convert corpse to bones if exist (to prevent exiting Corpse in World without DB entry)
-    // bones will be deleted by corpse/bones deleting thread shortly
-    sObjectAccessor.ConvertCorpseForPlayer(playerGuid);
-
-    // remove from guild
-    if (Guild* guild = sGuildMgr.GetPlayerGuild(playerGuid))
-    {
-        if (guild->DelMember(playerGuid))
-        {
-            guild->Disband();
-            delete guild;
-        }
-    }
-
-    // the player was uninvited already on logout so just remove from group
-    if (Group* group = sObjectMgr.GetGroupByMember(playerGuid))
-        RemoveFromGroup(group, playerGuid);
-
-    // remove signs from petitions (also remove petitions if owner);
-    RemovePetitionsAndSigns(playerGuid);
-    sObjectMgr.DeletePlayerFromCache(lowGuid);
+    CharacterDeletionRelationshipPlan relationshipPlan;
 
     switch (charDelete_method)
     {
-        // completely remove from the database
         case 0:
         {
-            // return back all mails with COD and Item                                  0      1               2                   3              4          5               6        7
-            std::unique_ptr<QueryResult> resultMail = CharacterDatabase.PQuery("SELECT `id`, `message_type`, `mail_template_id`, `sender_guid`, `subject`, `item_text_id`, `money`, `has_items` FROM `mail` WHERE `receiver_guid`='%u' AND `has_items`<>0 AND `cod`<>0", lowGuid);
-            if (resultMail)
+            std::unique_ptr<QueryResult> cod = CharacterDatabase.PQuery(
+                "SELECT COUNT(*) FROM `mail` WHERE `receiver_guid`='%u' "
+                "AND `has_items`<>0 AND `cod`<>0", lowGuid);
+            if (!cod)
+                return false;
+            Field* codFields = cod->Fetch();
+            uint64 codCount = 0;
+            if (!codFields ||
+                !ParseDeletionCount(codFields[0].GetString(), codCount))
+                return false;
+            if (codCount != 0)
             {
-                do
-                {
-                    Field* fields = resultMail->Fetch();
-
-                    uint32 mailId        = fields[0].GetUInt32();
-                    uint16 mailType       = fields[1].GetUInt16();
-                    uint16 mailTemplateId = fields[2].GetUInt16();
-                    uint32 sender         = fields[3].GetUInt32();
-                    std::string subject   = fields[4].GetCppString();
-                    uint32 itemTextId     = fields[5].GetUInt32();
-                    uint32 money          = fields[6].GetUInt32();
-                    bool hasItems         = fields[7].GetBool();
-
-                    //we can return mail now
-                    //so firstly delete the old one
-                    CharacterDatabase.PExecute("DELETE FROM `mail` WHERE `id` = '%u'", mailId);
-
-                    // mail not from player
-                    if (mailType != MAIL_NORMAL)
-                    {
-                        if (hasItems)
-                            CharacterDatabase.PExecute("DELETE FROM `mail_items` WHERE `mail_id` = '%u'", mailId);
-                        continue;
-                    }
-
-                    MailDraft draft;
-                    if (mailTemplateId)
-                        draft.SetMailTemplate(mailTemplateId, false); // items already included
-                    else
-                        draft.SetSubjectAndBodyId(subject, itemTextId);
-
-                    if (hasItems)
-                    {
-                        // data needs to be at first place for Item::LoadFromDB      0               1                    2        3                      5        6               7                     8             9       10                           11         12
-                        std::unique_ptr<QueryResult> resultItems = CharacterDatabase.PQuery("SELECT `creator_guid`, `gift_creator_guid`, `count`, `duration`, `charges`, `flags`, `enchantments`, `random_property_id`, `durability`, `text`, `item_guid`, `item_instance`.`item_id`, `generated_loot` FROM `mail_items` JOIN `item_instance` ON `item_guid` = `guid` WHERE `mail_id`='%u'", mailId);
-                        if (resultItems)
-                        {
-                            do
-                            {
-                                Field* fields2 = resultItems->Fetch();
-
-                                uint32 itemGuidLow = fields2[10].GetUInt32();
-                                uint32 itemId = fields2[11].GetUInt32();
-
-                                ItemPrototype const* itemProto = sObjectMgr.GetItemPrototype(itemId);
-                                if (!itemProto)
-                                {
-                                    CharacterDatabase.PExecute("DELETE FROM `item_instance` WHERE `guid` = '%u'", itemGuidLow);
-                                    continue;
-                                }
-
-                                Item* pItem = NewItemOrBag(itemProto);
-                                if (!pItem->LoadFromDB(itemGuidLow, playerGuid, fields2, itemId))
-                                {
-                                    pItem->FSetState(ITEM_REMOVED);
-                                    pItem->SaveToDB();              // it also deletes item object !
-                                    continue;
-                                }
-
-                                draft.AddItem(pItem);
-                            }
-                            while (resultItems->NextRow());
-                        }
-                    }
-
-                    CharacterDatabase.PExecute("DELETE FROM `mail_items` WHERE `mail_id` = '%u'", mailId);
-
-                    uint32 pl_account = sObjectMgr.GetPlayerAccountIdByGUID(playerGuid);
-
-                    draft.SetMoney(money).SendReturnToSender(pl_account, playerGuid, ObjectGuid(HIGHGUID_PLAYER, sender));
-                }
-                while (resultMail->NextRow());
+                sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                         "Permanent deletion refused for guid %u: returnable COD mail is unsupported",
+                         lowGuid);
+                return false;
             }
 
-            // unsummon and delete for pets in world is not required: player deleted from CLI or character list with not loaded pet.
-            // Get guids of character's pets, will deleted in transaction
-            std::unique_ptr<QueryResult> resultPets = CharacterDatabase.PQuery("SELECT `id` FROM `character_pet` WHERE `owner_guid` = '%u'", lowGuid);
+            // Read only: cache entries are published only after the checked batch commits.
+            std::unique_ptr<QueryResult> resultPets = CharacterDatabase.PQuery(
+                "SELECT `id` FROM `character_pet` WHERE `owner_guid` = '%u'", lowGuid);
 
-            // NOW we can finally clear other DB data related to character
-            CharacterDatabase.BeginTransaction();
+            CharacterPersistenceContext context(CharacterDatabase, lowGuid);
+            if (!AppendPermanentCharacterDeletion(CharacterDatabase, context, snapshot) ||
+                !AppendCharacterDeletionRelationships(context, playerGuid,
+                                                      relationshipPlan))
+            {
+                sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                         "Permanent deletion assembly failed for guid %u", lowGuid);
+                return false;
+            }
+            SqlBatchResult const result = context.Execute();
+            if (result.outcome != SqlWriteOutcome::Succeeded ||
+                result.stage != SqlBatchStage::Complete)
+            {
+                if (result.outcome == SqlWriteOutcome::OutcomeUnknown)
+                {
+                    BlockCharacterRecovery(CharacterRecoveryRecord{
+                        CharacterRecoveryKind::PermanentDeletion, {lowGuid},
+                        {snapshot.identity.accountId},
+                        snapshot.identity.generation,
+                        "permanent deletion outcome unknown"});
+                }
+                sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                         "Permanent deletion failed for guid %u (stage %u, stmt %zu)",
+                         lowGuid, uint32(result.stage), result.statementIndex);
+                return false;
+            }
+
             if (resultPets)
             {
                 do
                 {
-                    Field* fields3 = resultPets->Fetch();
-                    uint32 petguidlow = fields3[0].GetUInt32();
-                    //do not create separate transaction for pet delete otherwise we will get fatal error!
-                    Pet::DeleteFromDB(petguidlow, false);
+                    Field* fields = resultPets->Fetch();
+                    sCharacterDatabaseCache.DeleteCharacterPetById(fields[0].GetUInt32());
                 }
                 while (resultPets->NextRow());
             }
-
-            CharacterDatabase.PExecute("DELETE FROM `characters` WHERE `guid` = '%u'", lowGuid);
-            CharacterDatabase.PExecute("DELETE FROM `character_action` WHERE `guid` = '%u'", lowGuid);
-            CharacterDatabase.PExecute("DELETE FROM `character_aura` WHERE `guid` = '%u'", lowGuid);
-            CharacterDatabase.PExecute("DELETE FROM `character_battleground_data` WHERE `guid` = '%u'", lowGuid);
-            CharacterDatabase.PExecute("DELETE FROM `character_deleted_items` WHERE `player_guid` = '%u'", lowGuid);
-            CharacterDatabase.PExecute("DELETE FROM `character_gifts` WHERE `guid` = '%u'", lowGuid);
-            CharacterDatabase.PExecute("DELETE FROM `character_homebind` WHERE `guid` = '%u'", lowGuid);
-            CharacterDatabase.PExecute("DELETE FROM `character_instance` WHERE `guid` = '%u'", lowGuid);
-            CharacterDatabase.PExecute("DELETE FROM `group_instance` WHERE `leader_guid` = '%u'", lowGuid);
-            CharacterDatabase.PExecute("DELETE FROM `character_inventory` WHERE `guid` = '%u'", lowGuid);
-            CharacterDatabase.PExecute("DELETE FROM `character_queststatus` WHERE `guid` = '%u'", lowGuid);
-            CharacterDatabase.PExecute("DELETE FROM `character_reputation` WHERE `guid` = '%u'", lowGuid);
-            CharacterDatabase.PExecute("DELETE FROM `character_skills` WHERE `guid` = '%u'", lowGuid);
-            CharacterDatabase.PExecute("DELETE FROM `character_forgotten_skills` WHERE `guid` = '%u'", lowGuid);
-            CharacterDatabase.PExecute("DELETE FROM `character_spell` WHERE `guid` = '%u'", lowGuid);
-            CharacterDatabase.PExecute("DELETE FROM `character_spell_cooldown` WHERE `guid` = '%u'", lowGuid);
-            CharacterDatabase.PExecute("DELETE FROM `item_instance` WHERE `owner_guid` = '%u'", lowGuid);
-            CharacterDatabase.PExecute("DELETE FROM `character_social` WHERE `guid` = '%u' OR `friend`='%u'", lowGuid, lowGuid);
-            CharacterDatabase.PExecute("DELETE FROM `mail` WHERE `receiver_guid` = '%u'", lowGuid);
-            CharacterDatabase.PExecute("DELETE FROM `mail_items` WHERE `receiver_guid` = '%u'", lowGuid);
-            CharacterDatabase.PExecute("DELETE FROM `character_pet` WHERE `owner_guid` = '%u'", lowGuid);
-            CharacterDatabase.PExecute("DELETE FROM `guild_eventlog` WHERE `player_guid1` = '%u' OR `player_guid2` = '%u'", lowGuid, lowGuid);
-            CharacterDatabase.CommitTransaction();
             break;
         }
-        // The character gets unlinked from the account, the name gets freed up and appears as deleted ingame
         case 1:
-            CharacterDatabase.PExecute("UPDATE `characters` SET `deleted_name`=`name`, `deleted_account`=`account`, `deleted_time`='" UI64FMTD "', `name`='', `account`=0 WHERE `guid`=%u", uint64(time(nullptr)), lowGuid);
+        {
+            if (snapshot.deletedTime != 0)
+                return false;
+
+            SoftCharacterDeletion deletion;
+            deletion.identity = snapshot.identity;
+            deletion.deletionTime = uint64(time(nullptr));
+
+            CharacterPersistenceContext context(CharacterDatabase, lowGuid);
+            if (!AppendSoftCharacterDeletion(CharacterDatabase, context, deletion) ||
+                !AppendCharacterDeletionRelationships(context, playerGuid,
+                                                      relationshipPlan))
+            {
+                sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                         "Soft deletion assembly failed for guid %u", lowGuid);
+                return false;
+            }
+            SqlBatchResult const result = context.Execute();
+            if (result.outcome != SqlWriteOutcome::Succeeded ||
+                result.stage != SqlBatchStage::Complete)
+            {
+                if (result.outcome == SqlWriteOutcome::OutcomeUnknown)
+                {
+                    BlockCharacterRecovery(CharacterRecoveryRecord{
+                        CharacterRecoveryKind::SoftDeletion, {lowGuid},
+                        {deletion.identity.accountId},
+                        deletion.identity.generation,
+                        "soft deletion outcome unknown"});
+                }
+                sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                         "Soft deletion failed for guid %u (stage %u, stmt %zu)",
+                         lowGuid, uint32(result.stage), result.statementIndex);
+                return false;
+            }
             break;
+        }
         default:
-            sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "Player::DeleteFromDB: Unsupported delete method: %u.", charDelete_method);
+            sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                     "Player::DeleteFromDB: Unsupported delete method: %u.", charDelete_method);
+            return false;
     }
 
-    if (updateRealmChars)
-        sWorld.UpdateRealmCharCount(accountId);
-}
+    // The batch committed; these are local publication effects only.  Guild,
+    // group and petition SQL was part of the checked unit above, so no
+    // relationship write can escape it or run before the commit.
+    sObjectAccessor.ConvertCorpseForPlayer(playerGuid, nullptr, false);
+    ApplyCharacterDeletionRelationships(relationshipPlan);
+    sObjectMgr.DeletePlayerFromCache(lowGuid);
 
+    if (updateRealmChars && !sWorld.UpdateRealmCharCount(accountId, lease))
+    {
+        BlockCharacterRecovery(CharacterRecoveryRecord{
+            CharacterRecoveryKind::PermanentDeletion, {lowGuid},
+            {accountId}, snapshot.identity.generation,
+            "character committed but realm count publication failed"});
+        return false;
+    }
+    return true;
+}
 /**
  * Characters which were kept back in the database after being deleted and are now too old (see config option "CharDelete.KeepDays"), will be completely deleted.
  *
@@ -4515,14 +4566,23 @@ void Player::DeleteOldCharacters()
  */
 void Player::DeleteOldCharacters(uint32 keepDays)
 {
-    std::unique_ptr<QueryResult> resultChars = CharacterDatabase.PQuery("SELECT `guid`, `deleted_account` FROM `characters` WHERE `deleted_account` IS NOT NULL AND `deleted_time` IS NOT NULL AND `deleted_time` < '" UI64FMTD "' LIMIT 0,2", uint64(time(nullptr) - time_t(keepDays * DAY)));
-    if (resultChars)
+    std::unique_ptr<QueryResult> resultChars = CharacterDatabase.PQuery("SELECT `guid`, `deleted_account`, `deleted_name`, `identity_generation`, `deleted_time` FROM `characters` WHERE `deleted_account` IS NOT NULL AND `deleted_time` IS NOT NULL AND `deleted_time` < '" UI64FMTD "' LIMIT 0,2", uint64(time(nullptr) - time_t(keepDays * DAY)));
+    if (resultChars && resultChars->GetRowCount() > 0)
     {
         do
         {
             Field* charFields = resultChars->Fetch();
+            if (!charFields)
+                break;
             ObjectGuid guid = ObjectGuid(HIGHGUID_PLAYER, charFields[0].GetUInt32());
-            Player::DeleteFromDB(guid, charFields[1].GetUInt32(), true, true);
+            CharacterDeletionSnapshot snapshot;
+            snapshot.identity.guid = charFields[0].GetUInt32();
+            snapshot.identity.accountId = charFields[1].GetUInt32();
+            snapshot.identity.canonicalName = charFields[2].GetCppString();
+            snapshot.identity.generation = charFields[3].GetUInt64();
+            snapshot.deletedTime = charFields[4].GetUInt64();
+            Player::DeleteFromDB(guid, snapshot.identity.accountId, true, true,
+                                 &snapshot);
         }
         while (resultChars->NextRow());
     }
@@ -6469,7 +6529,7 @@ uint32 Player::GetZoneIdFromDB(ObjectGuid guid)
 {
     uint32 lowGuid = guid.GetCounter();
     uint32 zone = 0;
-    if (PlayerCacheData* data = sObjectMgr.GetPlayerDataByGUID(guid))
+    if (PlayerCacheSnapshot data = sObjectMgr.GetPlayerDataByGUID(guid))
     {
         if (data->uiZoneId)
             zone = data->uiZoneId;
@@ -6509,7 +6569,7 @@ uint32 Player::GetLevelFromDB(ObjectGuid guid)
 {
     uint32 lowGuid = guid.GetCounter();
 
-    if (PlayerCacheData* data = sObjectMgr.GetPlayerDataByGUID(lowGuid))
+    if (PlayerCacheSnapshot data = sObjectMgr.GetPlayerDataByGUID(lowGuid))
     {
         return data->uiLevel;
     }
@@ -14525,7 +14585,7 @@ void Player::_LoadBGData(std::unique_ptr<QueryResult> result)
 
 bool Player::LoadPositionFromDB(ObjectGuid guid, uint32& mapId, float& x, float& y, float& z, float& o, bool& in_flight)
 {
-    if (PlayerCacheData* data = sObjectMgr.GetPlayerDataByGUID(guid.GetCounter()))
+    if (PlayerCacheSnapshot data = sObjectMgr.GetPlayerDataByGUID(guid.GetCounter()))
     {
         x = data->fPosX;
         y = data->fPosY;
@@ -14617,7 +14677,15 @@ bool Player::LoadFromDB(ObjectGuid guid, SqlQueryHolder* holder)
 
     // check name limitations
     m_name = fields[2].GetCppString();
-    if (ObjectMgr::CheckPlayerName(m_name) != CHAR_NAME_SUCCESS ||
+    m_identityGeneration = fields[58].GetUInt64();
+    if (m_identityGeneration == 0)
+    {
+        sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                 "%s has zero identity generation, can't load.",
+                 guid.GetString().c_str());
+        return false;
+    }
+    if (!isCanonicalFullPlayerName(m_name) ||
        (GetSession()->GetSecurity() == SEC_PLAYER && sObjectMgr.IsReservedName(m_name)))
     {
         CharacterDatabase.PExecute("UPDATE `characters` SET `character_flags` = `character_flags` | '%u' WHERE `guid` ='%u'",
@@ -16167,34 +16235,50 @@ void Player::_LoadGuild(std::unique_ptr<QueryResult> result)
 /***                   SAVE SYSTEM                     ***/
 /*********************************************************/
 
-bool Player::SaveNewPlayer(WorldSession* session, uint32 guidlow, std::string const& name, uint8 raceId, uint8 classId, uint8 gender, uint8 skin, uint8 face, uint8 hairStyle, uint8 hairColor, uint8 facialHair)
+uint8 Player::SaveNewPlayer(WorldSession* session, uint32 guidlow, std::string const& name, uint8 raceId, uint8 classId, uint8 gender, uint8 skin, uint8 face, uint8 hairStyle, uint8 hairColor, uint8 facialHair, AccountLifecycleLease const* lease)
 {
+    if (!session || guidlow == 0 || session->GetAccountId() == 0 ||
+        !isCanonicalFullPlayerName(name))
+        return CHAR_CREATE_ERROR;
+
+    AccountLifecycleLeasePtr ownedLease;
+    if (!lease)
+    {
+        ownedLease = GetAccountLifecycleRegistry().TryAcquire(
+            {session->GetAccountId()}, AccountLifecycleKind::Mutation);
+        lease = ownedLease.get();
+    }
+    if (!lease || !lease->IsActive() ||
+        !GetAccountLifecycleRegistry().Allows(
+            *lease, session->GetAccountId(), AccountLifecycleKind::Mutation))
+        return CHAR_CREATE_ERROR;
+
     PlayerInfo const* info = sObjectMgr.GetPlayerInfo(raceId, classId);
     if (!info)
     {
         sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "Player have incorrect race/class pair. Can't be loaded.");
-        return false;
+        return CHAR_CREATE_ERROR;
     }
 
     ChrClassesEntry const* cEntry = sChrClassesStore.LookupEntry(classId);
     if (!cEntry)
     {
         sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "Class %u not found in DBC (Wrong DBC files?)", classId);
-        return false;
+        return CHAR_CREATE_ERROR;
     }
 
     // player store gender in single bit
     if (gender != uint8(GENDER_MALE) && gender != uint8(GENDER_FEMALE))
     {
         sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "Invalid gender %u at player creating", uint32(gender));
-        return false;
+        return CHAR_CREATE_ERROR;
     }
 
-    CharacterDatabase.BeginTransaction(guidlow);
+    CharacterPersistenceContext context(CharacterDatabase, guidlow);
 
     static SqlStatementID insChar;
 
-    SqlStatement uberInsert = CharacterDatabase.CreateStatement(insChar,"REPLACE INTO `characters` (`guid`, `account`, `name`, `race`, `class`, `gender`, `level`, `money`, "
+    SqlStatement uberInsert = CharacterDatabase.CreateStatement(insChar,"INSERT INTO `characters` (`guid`, `account`, `name`, `race`, `class`, `gender`, `level`, `money`, "
         "`skin`, `face`, `hair_style`, `hair_color`, `facial_hair`, "
         "`map`, `position_x`, `position_y`, `position_z`, `orientation`, "
         "`known_taxi_mask`, `current_taxi_path`, `online`, `extra_flags`, "
@@ -16307,26 +16391,85 @@ bool Player::SaveNewPlayer(WorldSession* session, uint32 guidlow, std::string co
     uberInsert.addUInt32(WORLD_DEFAULT_CHAR);
     uberInsert.addUInt64(uint64(time(nullptr))); // create time
     uberInsert.addUInt64(uint64(time(nullptr))); // logout time (for rested xp)
-    uberInsert.Execute();
+    if (!uberInsert.AppendToCheckedBatch(
+            context.Batch(), SqlAffectedRowsPolicy::ExactlyOne))
+        return CHAR_CREATE_ERROR;
 
-    sObjectMgr.SetPlayerWorldMask(guidlow, WORLD_DEFAULT_CHAR);
-    session->SaveTutorialsData(); // changed only while character in game
+    static SqlStatementID insOwnership;
+    SqlStatement ownership = CharacterDatabase.CreateStatement(
+        insOwnership,
+        "INSERT INTO `character_name_ownership` (`canonical_name`, `guid`) "
+        "VALUES (?, ?)");
+    ownership.addString(name);
+    ownership.addUInt32(guidlow);
+    if (!ownership.AppendToCheckedBatch(
+            context.Batch(), SqlAffectedRowsPolicy::ExactlyOne))
+        return CHAR_CREATE_ERROR;
 
-    CharacterDatabase.CommitTransaction();
+    if (!session->AppendTutorialsDataToCheckedBatch(context.Batch()))
+        return CHAR_CREATE_ERROR;
+
+    MasterPlayer masterPlayer(session);
+    masterPlayer.Create(ObjectGuid(HIGHGUID_PLAYER, guidlow), raceId, classId);
+    static SqlStatementID insAction;
+    for (auto const& action : masterPlayer.GetActionButtons())
+    {
+        SqlStatement stmt = CharacterDatabase.CreateStatement(
+            insAction,
+            "INSERT INTO `character_action` (`guid`, `button`, `action`, `type`) "
+            "VALUES (?, ?, ?, ?)");
+        stmt.addUInt32(guidlow);
+        stmt.addUInt32(uint32(action.first));
+        stmt.addUInt32(action.second.GetAction());
+        stmt.addUInt32(uint32(action.second.GetType()));
+        if (!stmt.AppendToCheckedBatch(
+                context.Batch(), SqlAffectedRowsPolicy::ExactlyOne))
+            return CHAR_CREATE_ERROR;
+    }
+
+    SqlBatchResult const batch = context.Execute();
+    CharacterNameWriteStatus const status =
+        ClassifyCharacterNameClaim(batch, 1);
+    if (status != CharacterNameWriteStatus::Committed)
+    {
+        if (status == CharacterNameWriteStatus::NameInUse)
+            return CHAR_CREATE_NAME_IN_USE;
+        if (status == CharacterNameWriteStatus::OutcomeUnknown)
+        {
+            BlockCharacterRecovery(CharacterRecoveryRecord{
+                CharacterRecoveryKind::WholeSave, {guidlow},
+                {session->GetAccountId()}, 0,
+                "character creation outcome unknown"});
+            sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                     "Character creation outcome unknown for guid %u (stage %u, stmt %zu)",
+                     guidlow, uint32(batch.stage), batch.statementIndex);
+        }
+        return CHAR_CREATE_ERROR;
+    }
 
     uint32 zoneId = 0;
     uint32 areaId = 0;
     if (auto map = sMapMgr.FindMap(info->mapId))
         map->GetTerrain()->GetZoneAndAreaId(zoneId, areaId, info->positionX, info->positionY, info->positionZ);
 
-    MasterPlayer masterPlayer(session);
-    masterPlayer.Create(ObjectGuid(HIGHGUID_PLAYER, guidlow), raceId, classId);
-    masterPlayer.SaveToDB();
-    PlayerCacheData* cacheData = sObjectMgr.InsertPlayerInCache(guidlow, raceId, classId, gender, session->GetAccountId(), name, startingLevel, zoneId);
-    sObjectMgr.UpdatePlayerCachedPosition(cacheData, info->mapId, info->positionX, info->positionY, info->positionZ, info->orientation, false);
+    PlayerCacheSnapshot cacheData = sObjectMgr.InsertPlayerInCache(guidlow, raceId, classId, gender, session->GetAccountId(), name, startingLevel, zoneId);
+    if (!cacheData)
+    {
+        BlockCharacterRecovery(CharacterRecoveryRecord{
+            CharacterRecoveryKind::WholeSave, {guidlow},
+            {session->GetAccountId()}, 1,
+            "character creation committed but cache publication failed"});
+        sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                 "Committed character creation was rejected by cache publication: guid %u",
+                 guidlow);
+        return CHAR_CREATE_ERROR;
+    }
+    sObjectMgr.UpdatePlayerCachedPosition(guidlow, info->mapId, info->positionX, info->positionY, info->positionZ, info->orientation, false);
+    sObjectMgr.SetPlayerWorldMask(guidlow, WORLD_DEFAULT_CHAR);
+    session->MarkTutorialsDataSaved();
     sLog.Player(session, LOG_CHAR, "Create", LOG_LVL_BASIC, "Character %s guid %u", name.c_str(), guidlow);
 
-    return true;
+    return CHAR_CREATE_SUCCESS;
 }
 
 void Player::UpdateCharacterFlags()
@@ -16344,231 +16487,9 @@ void Player::UpdateCharacterFlags()
     SetCharacterFlag(CHARACTER_FLAG_GM_MODE, HasFlag(PLAYER_FLAGS, PLAYER_FLAGS_GM));
 }
 
-void Player::SaveToDB(bool online, bool force)
-{
-    // we should assure this: ASSERT((m_nextSave != sWorld.getConfig(CONFIG_UINT32_INTERVAL_SAVE)));
-    // delay auto save at any saves (manual, in code, or autosave)
-    m_nextSave = sWorld.getConfig(CONFIG_UINT32_INTERVAL_SAVE);
-
-    // Do not save bots
-    if (IsSavingDisabled())
-        return;
-
-    // lets allow only players in world to be saved
-    if (!force && IsBeingTeleportedFar())
-    {
-        ScheduleDelayedOperation(DELAYED_SAVE_PLAYER);
-        return;
-    }
-
-    CharacterDatabase.BeginTransaction(GetGUIDLow());
-
-    m_honorMgr.Update();
-
-    static SqlStatementID insChar;
-
-    SqlStatement uberInsert = CharacterDatabase.CreateStatement(insChar, "REPLACE INTO `characters` (`guid`, `account`, `name`, `race`, `class`, `gender`, `level`, `xp`, `money`, `skin`, `face`, `hair_style`, `hair_color`, `facial_hair`, `bank_bag_slots`, `character_flags`,"
-                              "`map`, `instance`, `position_x`, `position_y`, `position_z`, `orientation`, "
-                              "`transport_guid`, `transport_x`, `transport_y`, `transport_z`, `transport_o`, "
-                              "`known_taxi_mask`, `current_taxi_path`, `online`, `played_time_total`, `played_time_level`, "
-                              "`rest_bonus`, `logout_time`, `reset_talents_multiplier`, `reset_talents_time`, "
-                              "`extra_flags`, `stable_slots`, `zone`, `death_expire_time`,"
-                              "`honor_rank_points`, `honor_highest_rank`, `honor_standing`, `honor_last_week_hk`, `honor_last_week_cp`, `honor_stored_hk`, `honor_stored_dk`, "
-                              "`watched_faction`, `drunk`, `health`, `power1`, `power2`, `power3`, `power4`, `power5`, "
-                              "`explored_zones`, `equipment_cache`, `ammo_id`, `action_bars`, `world_phase_mask`, `create_time`) "
-                              "VALUES ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                              "?, ?, ?, ?, ?, ?, "
-                               "?, ?, ?, ?, ?, "
-                              "?, ?, ?, ?, ?, "
-                              "?, ?, ?, ?, ?, "
-                              "?, ?, ?, ?, ?, "
-                              "?, ?, ?, ?, ?, ?, ?, "
-                              "?, ?, ?, ?, ?, ?, ?, ?, "
-                              "?, ?, ?, ?)");
-
-    uberInsert.addUInt32(GetGUIDLow());
-    uberInsert.addUInt32(GetSession()->GetAccountId());
-    uberInsert.addString(m_name);
-    uberInsert.addUInt8(GetRace());
-    uberInsert.addUInt8(GetClass());
-    uberInsert.addUInt8(GetGender());
-    uberInsert.addUInt32(GetLevel());
-    uberInsert.addUInt32(GetUInt32Value(PLAYER_XP));
-    uberInsert.addUInt32(GetMoney());
-    uberInsert.addUInt8(GetByteValue(PLAYER_BYTES, PLAYER_BYTES_OFFSET_SKIN_ID));
-    uberInsert.addUInt8(GetByteValue(PLAYER_BYTES, PLAYER_BYTES_OFFSET_FACE_ID));
-    uberInsert.addUInt8(GetByteValue(PLAYER_BYTES, PLAYER_BYTES_OFFSET_HAIR_STYLE_ID));
-    uberInsert.addUInt8(GetByteValue(PLAYER_BYTES, PLAYER_BYTES_OFFSET_HAIR_COLOR_ID));
-    uberInsert.addUInt32(GetByteValue(PLAYER_BYTES_2, PLAYER_BYTES_2_OFFSET_FACIAL_STYLE));
-    uberInsert.addUInt32(GetByteValue(PLAYER_BYTES_2, PLAYER_BYTES_2_OFFSET_BANK_BAG_SLOTS));
-
-    UpdateCharacterFlags();
-    uberInsert.addUInt32(m_characterFlags);
-
-    if (!IsBeingTeleported())
-    {
-        uberInsert.addUInt32(GetMapId());
-        uberInsert.addUInt32(GetInstanceId());
-        uberInsert.addFloat(finiteAlways(GetPositionX()));
-        uberInsert.addFloat(finiteAlways(GetPositionY()));
-        uberInsert.addFloat(finiteAlways(GetPositionZ()));
-        uberInsert.addFloat(Geometry::NormalizeOrientation(finiteAlways(GetOrientation())));
-    }
-    else
-    {
-        uberInsert.addUInt32(GetTeleportDest().mapId);
-        uberInsert.addUInt32(0);
-        uberInsert.addFloat(finiteAlways(GetTeleportDest().x));
-        uberInsert.addFloat(finiteAlways(GetTeleportDest().y));
-        uberInsert.addFloat(finiteAlways(GetTeleportDest().z));
-        uberInsert.addFloat(Geometry::NormalizeOrientation(finiteAlways(GetTeleportDest().o)));
-    }
-
-    if (m_transport)
-        uberInsert.addUInt32(m_transport->GetGUIDLow());
-    else
-        uberInsert.addUInt32(0);
-    uberInsert.addFloat(finiteAlways(m_movementInfo.GetTransportPos().x));
-    uberInsert.addFloat(finiteAlways(m_movementInfo.GetTransportPos().y));
-    uberInsert.addFloat(finiteAlways(m_movementInfo.GetTransportPos().z));
-    uberInsert.addFloat(Geometry::NormalizeOrientation(finiteAlways(m_movementInfo.GetTransportPos().o)));
-
-    std::ostringstream ss;
-    ss << m_taxi;                                   // string with TaxiMaskSize numbers
-    uberInsert.addString(ss);
-
-    ss << m_taxi.SaveTaxiDestinationsToString();
-    uberInsert.addString(ss);
-
-    if (!IsInWorld())
-        online = false;
-    uberInsert.addUInt32(online);
-
-    uberInsert.addUInt32(m_playedTime[PLAYED_TIME_TOTAL]);
-    uberInsert.addUInt32(m_playedTime[PLAYED_TIME_LEVEL]);
-
-    uberInsert.addFloat(finiteAlways(m_restBonus));
-    uberInsert.addUInt64(uint64(time(nullptr)));
-    uberInsert.addUInt32(m_resetTalentsMultiplier);
-    uberInsert.addUInt64(uint64(m_resetTalentsTime));
-    uberInsert.addUInt32(m_ExtraFlags);
-    uberInsert.addUInt32(uint32(m_stableSlots));                    // to prevent save uint8 as char
-    uberInsert.addUInt32(GetCachedZoneId());
-    uberInsert.addUInt64(uint64(m_deathExpireTime));
-
-    // Honor stored data
-    uberInsert.addFloat(finiteAlways(m_honorMgr.GetRankPoints()));
-    uberInsert.addUInt32(uint32(m_honorMgr.GetHighestRank().rank));
-    uberInsert.addUInt32(m_honorMgr.GetStanding());
-    uberInsert.addUInt32(m_honorMgr.GetLastWeekHK());
-    uberInsert.addFloat(finiteAlways(m_honorMgr.GetLastWeekCP()));
-    uberInsert.addUInt32(m_honorMgr.GetStoredHK());
-    uberInsert.addUInt32(m_honorMgr.GetStoredDK());
-
-#if SUPPORTED_CLIENT_BUILD > CLIENT_BUILD_1_9_4
-    uberInsert.addInt32(GetInt32Value(PLAYER_FIELD_WATCHED_FACTION_INDEX));
-#else
-    uberInsert.addInt32(-1);
-#endif
-
-    uberInsert.addUInt16(uint16(GetUInt32Value(PLAYER_BYTES_3) & 0xFFFE));
-
-    uberInsert.addUInt32(GetHealth());
-
-    for (uint32 i = 0; i < MAX_POWERS; ++i)
-        uberInsert.addUInt32(GetPower(Powers(i)));
-
-    for (uint32 i = 0; i < PLAYER_EXPLORED_ZONES_SIZE; ++i)         //string
-        ss << GetUInt32Value(PLAYER_EXPLORED_ZONES_1 + i) << " ";
-    uberInsert.addString(ss);
-
-    for (uint32 i = 0; i < EQUIPMENT_SLOT_END; ++i)         //string: item id, ench (perm/temp)
-    {
-        ss << GetUInt32Value(PLAYER_VISIBLE_ITEM_1_0 + i * MAX_VISIBLE_ITEM_OFFSET) << " ";
-
-        uint32 ench1 = GetUInt32Value(PLAYER_VISIBLE_ITEM_1_0 + i * MAX_VISIBLE_ITEM_OFFSET + 1 + PERM_ENCHANTMENT_SLOT);
-        uint32 ench2 = GetUInt32Value(PLAYER_VISIBLE_ITEM_1_0 + i * MAX_VISIBLE_ITEM_OFFSET + 1 + TEMP_ENCHANTMENT_SLOT);
-        ss << uint32(MAKE_PAIR32(ench1, ench2)) << " ";
-    }
-    // 1 in vanilla/tbc - 4 in wotlk
-    for (uint32 i = INVENTORY_SLOT_BAG_START; i < INVENTORY_SLOT_BAG_START + 1; ++i) // string: item id, ench (perm/temp)
-    {
-        ss << (m_items[i] ? m_items[i]->GetEntry() : 0) << " ";
-        ss << uint32(MAKE_PAIR32(0, 0)) << " ";
-    }
-    uberInsert.addString(ss);
-
-    uberInsert.addUInt32(GetUInt32Value(PLAYER_AMMO_ID));
-
-    uberInsert.addUInt32(uint32(GetByteValue(PLAYER_FIELD_BYTES, PLAYER_FIELD_BYTES_OFFSET_ACTION_BARS)));
-    uberInsert.addUInt32(GetWorldMask());
-    uberInsert.addUInt64(uint64(m_createTime));
-    uberInsert.Execute();
-
-    _SaveBGData();
-    _SaveInventory();
-    _SaveQuestStatus();
-    _SaveSpells();
-    _SaveSpellCooldowns();
-    _SaveAuras();
-    _SaveSkills();
-    m_reputationMgr.SaveToDB();
-    m_honorMgr.Save();
-
-    // Systeme de phasing
-    sObjectMgr.SetPlayerWorldMask(GetGUIDLow(), GetWorldMask());
-    GetSession()->SaveTutorialsData();                      // changed only while character in game
-
-    CharacterDatabase.CommitTransaction();
-
-    // check if stats should only be saved on logout
-    // save stats can be out of transaction
-    if (m_session->IsLogingOut() || !sWorld.getConfig(CONFIG_BOOL_STATS_SAVE_ONLY_ON_LOGOUT))
-        _SaveStats();
-
-    // save pet (hunter pet level and experience and all type pets health/mana).
-    if (Pet* pet = GetPet())
-        pet->SavePetToDB(PET_SAVE_AS_CURRENT);
-    if (PlayerCacheData* data = sObjectMgr.GetPlayerDataByGUID(GetGUIDLow()))
-    {
-        data->uiLevel = GetLevel();
-        data->uiZoneId = GetCachedZoneId();
-    }
-}
-
-// fast save function for item/money cheating preventing - save only inventory and money state
-// Must be serialized in a transaction with the player GUID, or it can lead to duping by
-// relogging before the query completes
-void Player::SaveInventoryAndGoldToDB()
-{
-    if (IsSavingDisabled())
-        return;
-
-    bool haveTransaction = CharacterDatabase.InTransaction();
-    if (!haveTransaction)
-        CharacterDatabase.BeginTransaction(GetGUIDLow());
-    else if (CharacterDatabase.GetTransactionSerialId() != GetGUIDLow())
-        sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "[PLAYER SAVE] Player %s items are being saved in a transaction that is not serialized with its own GUID... potential dupe avenue", GetGuidStr().c_str());
-
-    _SaveInventory();
-    SaveGoldToDB();
-
-    if (!haveTransaction)
-        CharacterDatabase.CommitTransaction();
-}
-
-// Must be serialized in a transaction with the player GUID, or it can lead to duping by
-// relogging before the query completes
-void Player::SaveGoldToDB()
-{
-    if (IsSavingDisabled())
-        return;
-
-    static SqlStatementID updateGold ;
-
-    SqlStatement stmt = CharacterDatabase.CreateStatement(updateGold, "UPDATE `characters` SET `money` = ? WHERE `guid` = ?");
-    stmt.PExecute(GetMoney(), GetGUIDLow());
-}
+// Ordinary save persistence now lives in Database/CharacterSavePersistence.cpp so
+// the characters row, inventory/gold, state appenders and MasterPlayer mails share
+// one checked batch with commit-only publication.
 
 void Player::_SaveAuras()
 {

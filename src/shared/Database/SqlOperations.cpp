@@ -23,8 +23,12 @@
 #include "SqlDelayThread.h"
 #include "DatabaseEnv.h"
 #include "DatabaseImpl.h"
+#include "SqlCheckedBatchExecution.h"
+#include "SqlTransactionExecution.h"
 #include "Timer.h"
 #include "ThreadPool.h"
+
+#include <utility>
 
 #define LOCK_DB_CONN(conn) SqlConnection::Lock guard(conn)
 
@@ -48,26 +52,9 @@ SqlTransaction::~SqlTransaction()
 
 bool SqlTransaction::Execute(SqlConnection* conn)
 {
-    if(m_queue.empty())
-        return true;
-
     LOCK_DB_CONN(conn);
 
-    conn->BeginTransaction();
-
-    int const nItems = m_queue.size();
-    for (int i = 0; i < nItems; ++i)
-    {
-        SqlOperation* pStmt = m_queue[i];
-
-        if(!pStmt->Execute(conn))
-        {
-            conn->RollbackTransaction();
-            return false;
-        }
-    }
-
-    return conn->CommitTransaction();
+    return ExecuteSqlTransaction(*conn, m_queue);
 }
 
 SqlPreparedRequest::SqlPreparedRequest(int nIndex, SqlStmtParameters* arg) : m_nIndex(nIndex), m_param(arg)
@@ -102,6 +89,51 @@ bool SqlQuery::Execute(SqlConnection* conn)
     m_queue->add(m_callback);
 
     return true;
+}
+
+bool SqlCheckedWrite::Execute(SqlConnection* conn)
+{
+    if (!conn || !m_resultQueue || !m_completion)
+        return false;
+
+    SqlWriteResult result;
+    {
+        SqlConnection::Lock guard(conn);
+        result = conn->ExecuteChecked(m_sql);
+    }
+
+    m_resultQueue->add(new SqlWriteCallback(result, std::move(m_completion)));
+    m_completion = SqlWriteCompletion();
+    return result.outcome == SqlWriteOutcome::Succeeded;
+}
+
+SqlCheckedBatchOperation::SqlCheckedBatchOperation(
+    SqlCheckedBatch batch,
+    SqlBatchCompletion completion,
+    SqlResultQueue* resultQueue)
+    : SqlOperation(batch.GetSerialId()),
+      m_batch(std::move(batch)),
+      m_completion(std::move(completion)),
+      m_resultQueue(resultQueue)
+{
+}
+
+bool SqlCheckedBatchOperation::Execute(SqlConnection* conn)
+{
+    if (!conn || !m_resultQueue || !m_completion)
+        return false;
+
+    SqlBatchResult result;
+    {
+        SqlConnection::Lock guard(conn);
+        result = ExecuteSqlCheckedBatch(*conn, m_batch.Writes());
+    }
+
+    bool const succeeded = result.outcome == SqlWriteOutcome::Succeeded;
+    m_resultQueue->add(
+        MakeSqlBatchCallback(std::move(result), std::move(m_completion)).release());
+    m_completion = SqlBatchCompletion();
+    return succeeded;
 }
 
 void SqlResultQueue::Update(uint32 timeout)
@@ -158,12 +190,18 @@ SqlResultQueue::~SqlResultQueue(){}
 
 void SqlResultQueue::CancelAll()
 {
-    MaNGOS::IQueryCallback* cb;
+    // Shutdown cancellation must not execute Player/session callbacks on the
+    // stopping thread. Discard pending callbacks; they represent work whose
+    // owners may already be gone, and no success may be published for them.
+    MaNGOS::IQueryCallback* cb = nullptr;
     while (next(cb))
-    {
-        cb->SetResult(nullptr);
-        cb->Execute();
         delete cb;
+
+    while (_threadUnsafeWaitingQueries.next(cb))
+    {
+        delete cb;
+        if (numUnsafeQueries > 0)
+            --numUnsafeQueries;
     }
 }
 

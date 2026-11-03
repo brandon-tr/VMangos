@@ -20,6 +20,7 @@
  */
 
 #include "ObjectMgr.h"
+#include "PlayerName.h"
 #include "Database/DatabaseEnv.h"
 #include "Database/DatabaseImpl.h"
 #include "Database/SQLStorageImpl.h"
@@ -47,6 +48,9 @@
 #include "WaypointManager.h"
 #include "GossipDef.h"
 #include "Mail.h"
+#include "Mail/MailPersistence.h"
+#include "Database/CharacterPersistenceContext.h"
+#include "Database/CharacterPersistenceRecovery.h"
 #include "Formulas.h"
 #include "InstanceData.h"
 #include "CharacterDatabaseCache.h"
@@ -674,99 +678,46 @@ void ObjectMgr::LoadSavedVariable()
 }
 
 // Caching player data
-void ObjectMgr::LoadPlayerCacheData(uint32 lowGuid)
+bool ObjectMgr::LoadPlayerCacheData(uint32 lowGuid)
 {
-    std::unique_ptr<QueryResult> result;
-    if (!lowGuid)
+    std::string reason;
+    if (!m_playerIdentityCache.Reload(CharacterDatabase, lowGuid, reason))
     {
-        // load all characters (likely at startup)
-        m_playerCacheData.clear();
-        m_playerNameToGuid.clear();
-
-        result = CharacterDatabase.Query(
-            //       0       1       2        3         4          5       6        7          8      9             10            11            12             13
-            "SELECT `guid`, `race`, `class`, `gender`, `account`, `name`, `level`, `zone`, `map`, `position_x`, `position_y`, `position_z`, `orientation`, `current_taxi_path` FROM `characters`;");
+        sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                 "Failed to load player cache data: %s", reason.c_str());
+        return false;
     }
-    else
-    {
-        // load a single character (likely just restored)
-        result = CharacterDatabase.PQuery(
-            //       0       1       2        3         4          5       6        7          8      9             10            11            12             13
-            "SELECT `guid`, `race`, `class`, `gender`, `account`, `name`, `level`, `zone`, `map`, `position_x`, `position_y`, `position_z`, `orientation`, `current_taxi_path` FROM `characters` WHERE `guid`=%u;", lowGuid);
-    }
-
-    uint32 totalCount = 0;
-
-    if (!result)
-    {
-        if (!lowGuid)
-        {
-            BarGoLink bar(1);
-            bar.step();
-
-            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "");
-            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, ">> Loaded 0 cached player data ...");
-        }
-        return;
-    }
-
-    BarGoLink bar(result->GetRowCount());
-
-    do
-    {
-        bar.step();
-        Field* fields = result->Fetch();
-
-        // guid, race, class, gender, account, name
-        std::string name = fields[5].GetCppString();
-        if (normalizePlayerName(name))
-        {
-            PlayerCacheData* data = InsertPlayerInCache(fields[0].GetUInt32(), fields[1].GetUInt32(), fields[2].GetUInt32(),
-                fields[3].GetUInt32(), fields[4].GetUInt32(), name, fields[6].GetUInt32(), fields[7].GetUInt32());
-
-            UpdatePlayerCachedPosition(data, fields[8].GetUInt32(), fields[9].GetFloat(), fields[10].GetFloat(),
-                fields[11].GetFloat(), fields[12].GetFloat(), !fields[13].GetCppString().empty());
-        }
-        ++totalCount;
-    }
-    while (result->NextRow());
 
     if (!lowGuid)
     {
         sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "");
-        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, ">> Loaded %u players in cache.", totalCount);
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, ">> Loaded %u players in cache.",
+                 static_cast<uint32>(m_playerIdentityCache.Size()));
     }
+    return true;
 }
 
-PlayerCacheData* ObjectMgr::GetPlayerDataByGUID(uint32 guidLow)
+PlayerCacheSnapshot ObjectMgr::GetPlayerDataByGUID(uint32 guidLow) const
 {
-    auto itr = m_playerCacheData.find(guidLow);
-    if (itr != m_playerCacheData.end())
-        return &itr->second;
-    return nullptr;
+    return m_playerIdentityCache.Find(guidLow);
 }
 
-PlayerCacheData const* ObjectMgr::GetPlayerDataByGUID(uint32 guidLow) const
+PlayerCacheSnapshot ObjectMgr::GetPlayerDataByName(std::string const& name) const
 {
-    auto itr = m_playerCacheData.find(guidLow);
-    if (itr != m_playerCacheData.end())
-        return &itr->second;
-    return nullptr;
-}
-
-PlayerCacheData const* ObjectMgr::GetPlayerDataByName(std::string const& name) const
-{
-    if (ObjectGuid guid = GetPlayerGuidByName(name))
-        return GetPlayerDataByGUID(guid.GetCounter());
-    return nullptr;
+    std::string key = name;
+    if (!normalizeFullPlayerNameForLookup(key))
+        return PlayerCacheSnapshot();
+    return m_playerIdentityCache.FindName(key);
 }
 
 ObjectGuid ObjectMgr::GetPlayerGuidByName(std::string const& name) const
 {
-    auto itr = m_playerNameToGuid.find(name);
-    if (itr != m_playerNameToGuid.end())
-        return ObjectGuid(HIGHGUID_PLAYER, itr->second);
-    return ObjectGuid();
+    std::string key = name;
+    if (!normalizeFullPlayerNameForLookup(key))
+        return ObjectGuid();
+
+    PlayerCacheSnapshot data = m_playerIdentityCache.FindName(key);
+    return data ? ObjectGuid(HIGHGUID_PLAYER, data->uiGuid) : ObjectGuid();
 }
 
 bool ObjectMgr::GetPlayerNameByGUID(ObjectGuid guid, std::string &name) const
@@ -800,7 +751,7 @@ uint8 ObjectMgr::GetPlayerClassByGUID(ObjectGuid guid) const
 
     uint32 lowguid = guid.GetCounter();
 
-    if (PlayerCacheData const* data = GetPlayerDataByGUID(lowguid))
+    if (PlayerCacheSnapshot data = GetPlayerDataByGUID(lowguid))
     {
         return data->uiClass;
     }
@@ -835,118 +786,112 @@ uint32 ObjectMgr::GetPlayerAccountIdByPlayerName(std::string const& name) const
     return 0;
 }
 
-PlayerCacheData* ObjectMgr::InsertPlayerInCache(Player* pPlayer)
+PlayerCacheSnapshot ObjectMgr::InsertPlayerInCache(Player* pPlayer)
 {
     auto pSession = pPlayer->GetSession();
     if (!pSession)
-        return nullptr;
-    auto accountId = pSession->GetAccountId();
+        return PlayerCacheSnapshot();
 
-    return InsertPlayerInCache(pPlayer->GetGUIDLow(), pPlayer->GetRace(), pPlayer->GetClass(), pPlayer->GetGender(), accountId, pPlayer->GetName(), pPlayer->GetLevel(), pPlayer->GetCachedZoneId());
+    PlayerCacheData value;
+    value.uiGuid = pPlayer->GetGUIDLow();
+    value.uiRace = pPlayer->GetRace();
+    value.uiClass = pPlayer->GetClass();
+    value.uiGender = pPlayer->GetGender();
+    value.uiAccount = pSession->GetAccountId();
+    value.sName = pPlayer->GetName();
+    value.uiLevel = pPlayer->GetLevel();
+    value.uiZoneId = pPlayer->GetCachedZoneId();
+    value.uiMapId = pPlayer->GetMapId();
+    value.fPosX = pPlayer->GetPositionX();
+    value.fPosY = pPlayer->GetPositionY();
+    value.fPosZ = pPlayer->GetPositionZ();
+    value.fOrientation = pPlayer->GetOrientation();
+    value.bInFlight = pPlayer->IsTaxiFlying();
+    return m_playerIdentityCache.Upsert(std::move(value));
 }
 
 void ObjectMgr::UpdatePlayerCachedPosition(Player* pPlayer)
 {
-    auto iter = m_playerCacheData.find(pPlayer->GetGUIDLow());
-    PlayerCacheData* data = nullptr;
-    if (iter == m_playerCacheData.end())
-        data = InsertPlayerInCache(pPlayer);
-    else
-        data = &iter->second;
-
-    if (!data)
-        return;
-
-    UpdatePlayerCachedPosition(data, pPlayer->GetMapId(), pPlayer->GetPositionX(), pPlayer->GetPositionY(),
-        pPlayer->GetPositionZ(), pPlayer->GetOrientation(), pPlayer->IsTaxiFlying());
+    m_playerIdentityCache.UpdatePosition(
+        pPlayer->GetGUIDLow(), pPlayer->GetMapId(), pPlayer->GetPositionX(),
+        pPlayer->GetPositionY(), pPlayer->GetPositionZ(),
+        pPlayer->GetOrientation(), pPlayer->IsTaxiFlying());
 }
 
-void ObjectMgr::UpdatePlayerCachedPosition(uint32 lowGuid, uint32 mapId, float posX, float posY, float posZ, float o, bool inFlight)
+void ObjectMgr::UpdatePlayerCachedPosition(uint32 lowGuid, uint32 mapId,
+                                           float posX, float posY, float posZ,
+                                           float o, bool inFlight)
 {
-    auto iter = m_playerCacheData.find(lowGuid);
-    if (iter == m_playerCacheData.end())
-        return;
-
-    UpdatePlayerCachedPosition(&iter->second, mapId, posX, posY, posZ, o, inFlight);
-}
-
-void ObjectMgr::UpdatePlayerCachedPosition(PlayerCacheData* data, uint32 mapId, float posX, float posY, float posZ, float o, bool inFlight)
-{
-    data->uiMapId = mapId;
-    data->fPosX = posX;
-    data->fPosY = posY;
-    data->fPosZ = posZ;
-    data->fOrientation = o;
-    data->bInFlight = inFlight;
+    m_playerIdentityCache.UpdatePosition(lowGuid, mapId, posX, posY, posZ, o,
+                                         inFlight);
 }
 
 void ObjectMgr::UpdatePlayerCache(Player* pPlayer)
 {
-    auto iter = m_playerCacheData.find(pPlayer->GetGUIDLow());
-    PlayerCacheData* data = nullptr;
-    if (iter == m_playerCacheData.end())
-        data = InsertPlayerInCache(pPlayer);
-    else
-        data = &iter->second;
-
-    if (!data)
+    PlayerCacheSnapshot existing =
+        m_playerIdentityCache.Find(pPlayer->GetGUIDLow());
+    if (!existing)
         return;
+
     if (pPlayer->GetSession())
-        UpdatePlayerCache(data, pPlayer->GetRace(), pPlayer->GetClass(), pPlayer->GetGender(), pPlayer->GetSession()->GetAccountId(), pPlayer->GetName(), pPlayer->GetLevel(), pPlayer->GetCachedZoneId());
+    {
+        PlayerCacheData value = *existing;
+        value.uiAccount = pPlayer->GetSession()->GetAccountId();
+        value.uiRace = pPlayer->GetRace();
+        value.uiClass = pPlayer->GetClass();
+        value.uiGender = pPlayer->GetGender();
+        value.uiLevel = pPlayer->GetLevel();
+        value.uiZoneId = pPlayer->GetCachedZoneId();
+        value.sName = pPlayer->GetName();
+        m_playerIdentityCache.UpdateIfIdentityMatches(std::move(value));
+    }
 
-    UpdatePlayerCachedPosition(data, pPlayer->GetMapId(), pPlayer->GetPositionX(), pPlayer->GetPositionY(), pPlayer->GetPositionZ(), pPlayer->GetOrientation(), pPlayer->IsTaxiFlying());
+    m_playerIdentityCache.UpdatePosition(
+        pPlayer->GetGUIDLow(), pPlayer->GetMapId(), pPlayer->GetPositionX(),
+        pPlayer->GetPositionY(), pPlayer->GetPositionZ(),
+        pPlayer->GetOrientation(), pPlayer->IsTaxiFlying());
 }
 
-void ObjectMgr::UpdatePlayerCache(PlayerCacheData* data, uint32 race, uint32 _class, uint32 gender, uint32 accountId, std::string const& name, uint32 level, uint32 zoneId)
+void ObjectMgr::UpdatePlayerCachedLevelAndZone(uint32 lowGuid, uint32 level,
+                                               uint32 zoneId)
 {
-    data->uiAccount = accountId;
-    data->uiRace = race;
-    data->uiClass = _class;
-    data->uiGender = gender;
-    data->uiLevel = level;
-    data->sName = name;
-    data->uiZoneId = zoneId;
+    m_playerIdentityCache.UpdateLevelAndZone(lowGuid, level, zoneId);
 }
 
-PlayerCacheData* ObjectMgr::InsertPlayerInCache(uint32 lowGuid, uint32 race, uint32 _class, uint32 gender, uint32 accountId, std::string const& name, uint32 level, uint32 zoneId)
+PlayerCacheSnapshot ObjectMgr::InsertPlayerInCache(
+    uint32 lowGuid, uint32 race, uint32 _class, uint32 gender,
+    uint32 accountId, std::string const& name, uint32 level, uint32 zoneId)
 {
-    PlayerCacheData& data = m_playerCacheData[lowGuid];
-    data.uiGuid = lowGuid;
-    UpdatePlayerCache(&data, race, _class, gender, accountId, name, level, zoneId);
-    m_playerNameToGuid[name] = lowGuid;
-    return &data;
+    PlayerCacheData value;
+    value.uiGuid = lowGuid;
+    value.uiRace = race;
+    value.uiClass = _class;
+    value.uiGender = gender;
+    value.uiAccount = accountId;
+    value.sName = name;
+    value.uiLevel = level;
+    value.uiZoneId = zoneId;
+    return m_playerIdentityCache.Upsert(std::move(value));
 }
 
 void ObjectMgr::DeletePlayerFromCache(uint32 lowGuid)
 {
-    auto itr = m_playerCacheData.find(lowGuid);
-    if (itr != m_playerCacheData.end())
-    {
-        auto itr2 = m_playerNameToGuid.find(itr->second.sName);
-        if (itr2 != m_playerNameToGuid.end())
-            m_playerNameToGuid.erase(itr2);
-        m_playerCacheData.erase(itr);
-    }
+    m_playerIdentityCache.Erase(lowGuid);
 }
 
-void ObjectMgr::ChangePlayerNameInCache(uint32 guidLow, std::string const& oldName, std::string const& newName)
+bool ObjectMgr::ChangePlayerNameInCache(uint32 guidLow,
+                                        std::string const& oldName,
+                                        std::string const& newName)
 {
-    auto itr = m_playerCacheData.find(guidLow);
-    if (itr != m_playerCacheData.end())
-    {
-        m_playerNameToGuid.erase(oldName);
-        m_playerNameToGuid[newName] = guidLow;
-        itr->second.sName = newName;
-    }
+    return m_playerIdentityCache.Rename(guidLow, oldName, newName);
 }
 
-void ObjectMgr::GetPlayerDataForAccount(uint32 accountId, std::vector<PlayerCacheData const*>& data) const
+void ObjectMgr::GetPlayerDataForAccount(
+    uint32 accountId, std::vector<PlayerCacheSnapshot>& data) const
 {
-    for (const auto& iter : m_playerCacheData)
-    {
-        if (iter.second.uiAccount == accountId)
-            data.push_back(&iter.second);
-    }
+    std::vector<PlayerCacheSnapshot> accountData =
+        m_playerIdentityCache.FindAccount(accountId);
+    data.insert(data.end(), accountData.begin(), accountData.end());
 }
 
 Group* ObjectMgr::GetGroupById(uint32 id) const
@@ -6894,53 +6839,111 @@ void ObjectMgr::LoadNPCText()
     sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, ">> Loaded %u npc texts", count);
 }
 
+namespace
+{
+void BlockExpiredMailFailure(uint32 messageID, uint32 senderGuid,
+                             ObjectGuid receiverGuid, char const* detail)
+{
+    CharacterRecoveryRecord record;
+    record.kind = CharacterRecoveryKind::WholeSave;
+    if (senderGuid)
+        record.guids.push_back(senderGuid);
+    if (receiverGuid.GetCounter())
+        record.guids.push_back(receiverGuid.GetCounter());
+
+    uint32 const guids[] = {senderGuid, receiverGuid.GetCounter()};
+    for (uint32 guid : guids)
+    {
+        if (!guid)
+            continue;
+        uint32 const accountId = sObjectMgr.GetPlayerAccountIdByGUID(
+            ObjectGuid(HIGHGUID_PLAYER, guid));
+        if (accountId)
+            record.accountIds.push_back(accountId);
+    }
+
+    record.expectedGeneration = 0;
+    record.detail = std::string(detail) + " (mail " +
+                    std::to_string(messageID) + ")";
+    if (record.guids.empty() && record.accountIds.empty())
+        return;
+    BlockCharacterRecovery(record);
+    sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+             "Expired mail %u blocked: %s", messageID, detail);
+}
+}
+
 class SingleMailReturner
 {
 public:
-    SingleMailReturner() : returnToLowGuid(0) {}
+    SingleMailReturner() : returnToLowGuid(0), hasItems(false) {}
     uint32 returnToLowGuid; // Items deleted if null
     time_t basetime;
     uint32 messageID;
     ObjectGuid receiverGuid;
+    uint32 sender;
     uint32 itemTextId;
+    bool hasItems;
 
     void Callback(std::unique_ptr<QueryResult> result)
     {
-        uint32 item_guid = 0;
-        if (result)
-        {
-            Field* fields2 = result->Fetch();
-
-            item_guid = fields2[0].GetUInt32();
-        }
-
         if (!sObjectAccessor.FindPlayerNotInWorld(receiverGuid)) // Do not process online players!
         {
-            if (!returnToLowGuid) // Delete mail and items
+            if (!result)
             {
-                // mail open and then not returned
-                if (item_guid)
-                {
-                    CharacterDatabase.PExecute("DELETE FROM `item_instance` WHERE `guid` = '%u'", item_guid);
-                    CharacterDatabase.PExecute("DELETE FROM `mail_items` WHERE `mail_id` = '%u'", messageID);
-                }
-                if (itemTextId)
-                    CharacterDatabase.PExecute("DELETE FROM `item_text` WHERE `id` = '%u'", itemTextId);
+                // Ambiguous enumeration must never be treated as zero
+                // attachments; nothing destructive is performed.
+                BlockExpiredMailFailure(messageID, sender, receiverGuid,
+                                        "expired mail attachment enumeration failed");
+                delete this;
+                return;
+            }
 
-                CharacterDatabase.PExecute("DELETE FROM `mail` WHERE `id` = '%u'", messageID);
-            }
-            else                // Return to sender
+            // Every attachment row must be handled, not only the first one.
+            // The query is a LEFT JOIN on the mail row, so a present mail with
+            // no attachments yields one NULL item_guid row.
+            std::vector<MailItemInfo> attachments;
+            bool malformed = false;
+            do
             {
-                // mail will be returned:
-                CharacterDatabase.PExecute("UPDATE `mail` SET `sender_guid` = '%u', `receiver_guid` = '%u', `expire_time` = '" UI64FMTD "', `deliver_time` = '" UI64FMTD "', `cod` = '0', `checked` = '%u' WHERE `id` = '%u'",
-                                           receiverGuid.GetCounter(), returnToLowGuid, (uint64)(basetime + 30 * DAY), (uint64)basetime, MAIL_CHECK_MASK_RETURNED, messageID);
-                if (item_guid)
+                Field* fields = result->Fetch();
+                if (!fields)
                 {
-                    // update receiver in mail items for its proper delivery, and in instance_item for avoid lost item at sender delete
-                    CharacterDatabase.PExecute("UPDATE `mail_items` SET `receiver_guid` = %u WHERE `item_guid` = '%u'", returnToLowGuid, item_guid);
-                    CharacterDatabase.PExecute("UPDATE `item_instance` SET `owner_guid` = %u WHERE `guid` = '%u'", returnToLowGuid, item_guid);
+                    malformed = true;
+                    break;
                 }
+                uint32 itemGuid = fields[0].GetUInt32();
+                if (itemGuid)
+                    attachments.push_back(MailItemInfo{itemGuid, 0});
             }
+            while (result->NextRow());
+
+            if (malformed || (result->GetRowCount() == 0 && hasItems))
+            {
+                BlockExpiredMailFailure(messageID, sender, receiverGuid,
+                                        "expired mail attachment enumeration incomplete");
+                delete this;
+                return;
+            }
+
+            Mail mail;
+            mail.messageID = messageID;
+            mail.messageType = MAIL_NORMAL;
+            mail.sender = sender;
+            mail.receiverGuid = receiverGuid;
+            mail.itemTextId = itemTextId;
+            mail.has_items = hasItems || !attachments.empty();
+
+            MailPersistenceStatus const status = ProcessExpiredMail(
+                mail, attachments, returnToLowGuid != 0, basetime);
+            if (status == MailPersistenceStatus::OutcomeUnknown)
+                sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                         "Expired mail %u outcome unknown (blocked by the "
+                         "operation under admission)", messageID);
+            else if (status != MailPersistenceStatus::Committed)
+                sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                         "Expired mail %u processing failed (status %u)",
+                         messageID, uint32(status));
         }
         delete this;
     }
@@ -6977,6 +6980,9 @@ public:
             m.messageType = fields[1].GetUInt8();
             m.sender = fields[2].GetUInt32();
             m.receiverGuid = ObjectGuid(HIGHGUID_PLAYER, fields[3].GetUInt32());
+            // The selected body id must be retained for both return and
+            // disposal; previously it was read from the query but dropped.
+            m.itemTextId = fields[4].GetUInt32();
             bool has_items = fields[5].GetBool();
             m.expire_time = (time_t)fields[6].GetUInt64();
             m.deliver_time = 0;
@@ -6995,27 +7001,36 @@ public:
             if (has_items)
             {
                 SingleMailReturner* returner = new SingleMailReturner();
+                returner->basetime = basetime;
+                returner->sender = m.sender;
                 // if it is mail from non-player, or if it's already return mail, it shouldn't be returned, but deleted
                 if (m.messageType != MAIL_NORMAL || (m.checked & (MAIL_CHECK_MASK_COD_PAYMENT | MAIL_CHECK_MASK_RETURNED)))
                     returner->returnToLowGuid = 0;
                 else
-                {
-                    returner->basetime = basetime;
                     returner->returnToLowGuid = m.sender;
-                }
                 returner->receiverGuid = m.receiverGuid;
                 returner->itemTextId = m.itemTextId;
                 returner->messageID = m.messageID;
-                CharacterDatabase.AsyncPQueryUnsafe(returner, &SingleMailReturner::Callback, "SELECT `item_guid` FROM `mail_items` WHERE `mail_id`='%u'", m.messageID);
+                returner->hasItems = has_items;
+                // LEFT JOIN on the mail row: a present mail with no attachment
+                // rows is authoritative zero attachments; a missing result is a
+                // failure and is blocked in the callback.
+                CharacterDatabase.AsyncPQueryUnsafe(returner, &SingleMailReturner::Callback, "SELECT `mi`.`item_guid` FROM `mail` `m` LEFT JOIN `mail_items` `mi` ON `mi`.`mail_id` = `m`.`id` WHERE `m`.`id`='%u'", m.messageID);
                 continue;
             }
 
-            if (m.itemTextId)
-                CharacterDatabase.PExecute("DELETE FROM `item_text` WHERE `id` = '%u'", m.itemTextId);
-
-            // deletemail = true;
-            // delmails << m.messageID << ", ";
-            CharacterDatabase.PExecute("DELETE FROM `mail` WHERE `id` = '%u'", m.messageID);
+            // No attachments: dispose the mail and its selected body in one
+            // checked unit (same contract as the attachment path).
+            MailPersistenceStatus const status = ProcessExpiredMail(
+                m, std::vector<MailItemInfo>(), false, basetime);
+            if (status == MailPersistenceStatus::OutcomeUnknown)
+                sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                         "Expired empty mail %u outcome unknown (blocked by the "
+                         "operation under admission)", m.messageID);
+            else if (status != MailPersistenceStatus::Committed)
+                sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                         "Expired empty mail %u processing failed (status %u)",
+                         m.messageID, uint32(status));
 
         }
         while (result->NextRow());
@@ -8594,14 +8609,78 @@ static std::string GeneratePlayerName()
     return name;
 };
 
+static std::string CapitalizeAscii(std::string value)
+{
+    if (!value.empty() && value[0] >= 'a' && value[0] <= 'z')
+        value[0] = static_cast<char>(value[0] - 'a' + 'A');
+    return value;
+}
+
+namespace
+{
+std::mutex g_playerNameReservationMutex;
+std::set<std::string> g_reservedPlayerNames;
+}
+
+PlayerNameReservation::PlayerNameReservation(PlayerNameReservation&& other) noexcept
+    : m_name(std::move(other.m_name)), m_active(other.m_active)
+{
+    other.m_active = false;
+}
+
+PlayerNameReservation& PlayerNameReservation::operator=(
+    PlayerNameReservation&& other) noexcept
+{
+    if (this != &other)
+    {
+        Release();
+        m_name = std::move(other.m_name);
+        m_active = other.m_active;
+        other.m_active = false;
+    }
+    return *this;
+}
+
+PlayerNameReservation::~PlayerNameReservation()
+{
+    Release();
+}
+
+void PlayerNameReservation::Release()
+{
+    if (!m_active)
+        return;
+    {
+        std::lock_guard<std::mutex> lock(g_playerNameReservationMutex);
+        g_reservedPlayerNames.erase(m_name);
+    }
+    m_active = false;
+}
+
 std::string ObjectMgr::GenerateFreePlayerName()
 {
-    std::string name;
-    do
+    PlayerNameReservation reservation = ReserveFreePlayerName();
+    return reservation ? reservation.Name() : std::string();
+}
+
+PlayerNameReservation ObjectMgr::ReserveFreePlayerName()
+{
+    for (uint32 attempt = 0; attempt < 100; ++attempt)
     {
-        name = GeneratePlayerName();
-    } while (sObjectMgr.GetPlayerGuidByName(name));
-    return name;
+        std::string name = CapitalizeAscii(GeneratePlayerName()) + " " +
+                           CapitalizeAscii(GeneratePlayerName());
+        if (!isCanonicalFullPlayerName(name) || GetPlayerGuidByName(name))
+            continue;
+
+        std::lock_guard<std::mutex> lock(g_playerNameReservationMutex);
+        if (!g_reservedPlayerNames.insert(name).second)
+            continue;
+        PlayerNameReservation reservation;
+        reservation.m_name = name;
+        reservation.m_active = true;
+        return reservation;
+    }
+    return PlayerNameReservation();
 }
 
 std::string ObjectMgr::GeneratePetName(uint32 entry)

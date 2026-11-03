@@ -62,6 +62,7 @@ char const LockEntryfmt[]="niiiiiiiiiiiiiiiiiiiiiiiixxxxxxxx";
 char const MailTemplateEntryfmt[]="nxxxxxxxxx";
 char const MapEntryfmt[]="nxixssssssssxxxxxxxixxxxxxxxxxxxxxxxxxixxx";
 char const NamesProfanityEntryfmt[] = "ds";
+char const ChatProfanityEntryfmt[] = "ds";
 char const NamesReservedEntryfmt[] = "ds";
 char const QuestSortEntryfmt[]="nxxxxxxxxx";
 char const SkillLinefmt[]="nixssssssssxxxxxxxxxxi";

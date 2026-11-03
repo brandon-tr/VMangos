@@ -40,11 +40,15 @@
 #include "Common.h"
 #include "ObjectGuid.h"
 #include <map>
+#include <functional>
 
 struct AuctionEntry;
 class Item;
 class Object;
 class Player;
+class CharacterPersistenceContext;
+class AccountLifecycleLease;
+enum class MailPersistenceStatus;
 
 #define MAIL_BODY_ITEM_TEMPLATE 8383                        // - plain letter, A Dusty Unsent Letter: 889
 // The maximal amount of items a mail can contain.
@@ -192,7 +196,7 @@ class MailDraft
         *
         */
         MailDraft()
-            : m_mailTemplateId(0), m_mailTemplateItemsNeed(false), m_bodyId(0), m_money(0), m_COD(0) {}
+            : m_mailTemplateId(0), m_mailTemplateItemsNeed(false), m_bodyId(0), m_bodyTextPending(false), m_money(0), m_COD(0) {}
        /**
         * Creates a new MailDraft object using mail template id.
         *
@@ -208,7 +212,7 @@ class MailDraft
          * @param itemTextId The id of the body of the mail.
          */
         MailDraft(std::string subject, uint32 itemTextId = 0)
-            : m_mailTemplateId(0), m_mailTemplateItemsNeed(false), m_subject(subject), m_bodyId(itemTextId), m_money(0), m_COD(0) {}
+            : m_mailTemplateId(0), m_mailTemplateItemsNeed(false), m_subject(subject), m_bodyId(itemTextId), m_bodyTextPending(false), m_money(0), m_COD(0) {}
         /**
          * Creates a new MailDraft object using subject and contect texts.
          *
@@ -250,8 +254,22 @@ class MailDraft
 
         void CloneFrom(MailDraft const& draft);
     public:                                                 // finishers
-        void SendReturnToSender(uint32 sender_acc, ObjectGuid sender_guid, ObjectGuid receiver_guid);
-        void SendMailTo(MailReceiver const& receiver, MailSender const& sender, MailCheckMask checked = MAIL_CHECK_MASK_NONE, uint32 deliver_delay = 0, uint32 expire_delay = 0);
+        MailPersistenceStatus SendMailTo(MailReceiver const& receiver, MailSender const& sender, MailCheckMask checked = MAIL_CHECK_MASK_NONE, uint32 deliver_delay = 0, uint32 expire_delay = 0);
+        /// Stages this draft into one checked CharacterDatabase unit: body text
+        /// (if its id is still pending), every attachment item row, the
+        /// character_inventory removal, item ownership and the mail/mail_items
+        /// rows.  Online delivery publication is registered as a commit
+        /// callback; the caller owns Execute() and result classification.
+        bool AppendSendTo(CharacterPersistenceContext& context,
+                          MailReceiver const& receiver,
+                          MailSender const& sender,
+                          MailCheckMask checked, uint32 deliver_delay,
+                          uint32 expire_delay, uint32& mailId,
+                          std::function<void()> prePublication = nullptr);
+        /// The body text that still needs its item_text row inserted, or an
+        /// empty string when no insertion is pending.
+        bool HasPendingBodyText() const { return m_bodyTextPending; }
+        std::string const& GetPendingBodyText() const { return m_bodyText; }
     private:
         MailDraft(MailDraft const&);                        // trap decl, no body, mail draft must cloned only explicitly...
         MailDraft& operator=(MailDraft const&);             // trap decl, no body, ...because items clone is high price operation
@@ -267,6 +285,11 @@ class MailDraft
         std::string m_subject;
         // The ID of the body of the MailDraft.
         uint32      m_bodyId;
+        // True while m_bodyId was reserved locally but its item_text row has
+        // not been inserted yet.  It is published by the commit callback.
+        bool        m_bodyTextPending;
+        // Pending body text paired with m_bodyId.
+        std::string m_bodyText;
         // A map of items in this MailDraft.
         MailItemMap m_items;                                // Keep the items in a map to avoid duplicate guids (which can happen), store only low part of guid
 
@@ -380,7 +403,7 @@ struct Mail
      * Generate items for template if items not genereated before (receiver has been offline, has_items == false)
      *
      */
-    void prepareTemplateItems(Player* receiver);            // called from _LoadMails for generate mailTemplateBase items not generated for offline player
+    void prepareTemplateItems(Player* receiver, AccountLifecycleLease const* lease = nullptr);            // called from _LoadMails for generate mailTemplateBase items not generated for offline player
 };
 
 #endif

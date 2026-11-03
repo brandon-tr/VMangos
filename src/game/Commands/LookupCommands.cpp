@@ -1082,7 +1082,7 @@ bool ChatHandler::HandleLookupPlayerCharacterCommand(char* args)
     std::unique_ptr<QueryResult> result;
     std::string normalizedName = nameStr;
     if (normalizePlayerName(normalizedName)) {
-        if (PlayerCacheData const* data = sObjectMgr.GetPlayerDataByName(normalizedName)) {
+        if (PlayerCacheSnapshot data = sObjectMgr.GetPlayerDataByName(normalizedName)) {
             if (std::unique_ptr<QueryResult> resultByAccountId = LoginDatabase.PQuery("SELECT `id`, `last_ip` FROM `account` WHERE `id` = %u", data->uiAccount)) {
                 Field* fields = resultByAccountId->Fetch();
                 uint32 id = fields[0].GetInt32();

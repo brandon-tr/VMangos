@@ -1,5 +1,8 @@
 #include "MasterPlayer.h"
+#include "Database/CharacterPersistenceContext.h"
+#include "Database/CharacterPersistenceRecovery.h"
 #include "Database/DatabaseEnv.h"
+#include "Database/SqlPreparedStatement.h"
 #include "ObjectMgr.h"
 #include "SocialMgr.h"
 #include "Item.h"
@@ -8,6 +11,53 @@
 #include "ObjectAccessor.h"
 #include "WorldPacket.h"
 #include "Opcodes.h"
+#include "Player.h"
+#include "WorldSession.h"
+
+#include <algorithm>
+#include <limits>
+
+namespace
+{
+CharacterIdentitySnapshot MasterSaveIdentity(MasterPlayer const& player)
+{
+    CharacterIdentitySnapshot identity;
+    identity.guid = player.GetGUIDLow();
+    identity.accountId = player.GetSession() ? player.GetSession()->GetAccountId() : 0;
+    identity.canonicalName = player.name;
+    identity.generation = player.identityGeneration;
+    return identity;
+}
+
+bool MasterSaveIdentityMatches(MasterPlayer const& player,
+                               CharacterIdentitySnapshot const& expected)
+{
+    return player.GetGUIDLow() == expected.guid &&
+           player.GetSession() &&
+           player.GetSession()->GetAccountId() == expected.accountId &&
+           player.name == expected.canonicalName &&
+           player.identityGeneration == expected.generation;
+}
+
+void AppendMasterGenerationPublication(CharacterPersistenceContext& context,
+                                       MasterPlayer& master)
+{
+    std::vector<CharacterIdentitySnapshot> const& staged =
+        context.StagedIdentities();
+    if (staged.size() != 1)
+        return;
+    CharacterIdentitySnapshot const identity = staged.front();
+    Player* player = master.GetSession() ? master.GetSession()->GetPlayer() : nullptr;
+    if (player && player->GetIdentityGeneration() != identity.generation)
+        player = nullptr;
+    context.OnCommit([&master, player, identity]() {
+        if (master.identityGeneration == identity.generation)
+            master.SetIdentityGeneration(identity.generation + 1);
+        if (player && player->GetIdentityGeneration() == identity.generation)
+            player->SetIdentityGeneration(identity.generation + 1);
+    });
+}
+}
 
 MasterPlayer::MasterPlayer(WorldSession* s):
     m_session(s)
@@ -30,6 +80,7 @@ MasterPlayer::~MasterPlayer()
 void MasterPlayer::Create(ObjectGuid playerGuid, uint8 raceId, uint32 classId)
 {
     guid = playerGuid;
+    identityGeneration = 1;
     PlayerInfo const* info = sObjectMgr.GetPlayerInfo(raceId, classId);
     ASSERT(info);
 
@@ -47,6 +98,7 @@ void MasterPlayer::LoadPlayer(Player* player)
     raceId = player->GetRace();
     classId = player->GetClass();
     level = player->GetLevel();
+    identityGeneration = player->GetIdentityGeneration();
     guildId = player->GetGuildId();
     m_team = player->GetTeam();
     m_chatTag = player->GetChatTag();
@@ -57,10 +109,67 @@ void MasterPlayer::LoadPlayer(Player* player)
 
 void MasterPlayer::SaveToDB()
 {
-    CharacterDatabase.BeginTransaction(GetGUIDLow());
-    SaveActions();
-    SaveMails();
-    CharacterDatabase.CommitTransaction();
+    SaveChecked(true, true);
+}
+
+bool MasterPlayer::SaveChecked(bool includeActions, bool includeMails)
+{
+    if (!GetSession() || identityGeneration == 0 || GetGUIDLow() == 0)
+        return false;
+    if (IsCharacterRecoveryBlocked(GetGUIDLow()))
+        return false;
+
+    CharacterIdentitySnapshot const identity = MasterSaveIdentity(*this);
+    if (identity.accountId == 0 || identity.generation == 0 ||
+        identity.generation == std::numeric_limits<uint64>::max())
+        return false;
+
+    CharacterPersistenceAdmission admission;
+    if (!admission.Admit({identity.accountId}, AccountLifecycleKind::Mutation))
+        return false;
+
+    CharacterPersistenceContext context(CharacterDatabase, GetGUIDLow());
+    if (!context.AppendIdentityGuards({identity}))
+        return false;
+
+    if (includeActions && !AppendActionsToDB(context))
+        return false;
+    if (includeMails && !AppendMailsToDB(context))
+        return false;
+    if (context.Batch().Empty())
+        return true;
+
+    AppendMasterGenerationPublication(context, *this);
+    SqlBatchResult const result = context.Execute();
+    if (result.outcome != SqlWriteOutcome::Succeeded ||
+        result.stage != SqlBatchStage::Complete)
+    {
+        if (result.outcome == SqlWriteOutcome::OutcomeUnknown)
+            BlockCharacterRecovery(CharacterRecoveryRecord{
+                CharacterRecoveryKind::WholeSave, {GetGUIDLow()},
+                {identity.accountId}, identity.generation,
+                "master player save outcome unknown"});
+        sLog.Out(LOG_BASIC, LOG_LVL_ERROR,
+                 "MasterPlayer save failed for guid %u (outcome %u, stage %u)",
+                 GetGUIDLow(), uint32(result.outcome), uint32(result.stage));
+        return false;
+    }
+    return true;
+}
+
+bool MasterPlayer::HasPendingSave() const
+{
+    if (m_mailsUpdated)
+        return true;
+    for (auto const& entry : m_actionButtons)
+        if (entry.second.uState != ACTIONBUTTON_UNCHANGED)
+            return true;
+    return false;
+}
+
+bool MasterPlayer::AppendSaveToDB(CharacterPersistenceContext& context)
+{
+    return AppendActionsToDB(context) && AppendMailsToDB(context);
 }
 
 void MasterPlayer::Update()
@@ -86,80 +195,209 @@ void MasterPlayer::SaveMails()
 {
     if (!m_mailsUpdated)
         return;
+    SaveChecked(false, true);
+}
 
-    static SqlStatementID updateMail ;
-    static SqlStatementID deleteMailItems ;
-
-    static SqlStatementID deleteItem ;
-    static SqlStatementID deleteItemText;
-    static SqlStatementID deleteMain ;
-    static SqlStatementID deleteItems ;
-
-    for (PlayerMails::iterator itr = m_mail.begin(); itr != m_mail.end(); ++itr)
+bool MasterPlayer::AppendMailsToDB(CharacterPersistenceContext& context)
+{
+    CharacterIdentitySnapshot const identity = MasterSaveIdentity(*this);
+    if (!GetSession() || !context.HasIdentityGuard(identity))
     {
-        Mail *m = (*itr);
-        if (m->state == MAIL_STATE_CHANGED)
+        context.Invalidate();
+        return false;
+    }
+    Database* database = context.Batch().GetDatabase();
+    if (!database)
+    {
+        context.Invalidate();
+        return false;
+    }
+
+    struct MailAck
+    {
+        Mail* mail = nullptr;
+        uint32 itemTextId = 0;
+        bool hasItems = false;
+        uint64 expireTime = 0;
+        uint64 deliverTime = 0;
+        uint32 money = 0;
+        uint32 cod = 0;
+        uint32 checked = 0;
+        std::vector<uint32> removedItems;
+    };
+    std::vector<MailAck> acknowledgments;
+    std::vector<Mail*> removedMails;
+
+    for (Mail* mail : m_mail)
+    {
+        if (!mail)
+            continue;
+
+        if (mail->state == MAIL_STATE_CHANGED)
         {
-            SqlStatement stmt = CharacterDatabase.CreateStatement(updateMail, "UPDATE `mail` SET `item_text_id` = ?, `has_items` = ?, `expire_time` = ?, `deliver_time` = ?, `money` = ?, `cod` = ?, `checked` = ? WHERE `id` = ?");
-            stmt.addUInt32(m->itemTextId);
-            stmt.addUInt32(m->HasItems() ? 1 : 0);
-            stmt.addUInt64(uint64(m->expire_time));
-            stmt.addUInt64(uint64(m->deliver_time));
-            stmt.addUInt32(m->money);
-            stmt.addUInt32(m->COD);
-            stmt.addUInt32(m->checked);
-            stmt.addUInt32(m->messageID);
-            stmt.Execute();
-
-            if (!m->removedItems.empty())
+            static SqlStatementID updateMail;
+            SqlStatement statement = database->CreateStatement(
+                updateMail,
+                "UPDATE `mail` SET `item_text_id` = ?, `has_items` = ?, `expire_time` = ?, `deliver_time` = ?, `money` = ?, `cod` = ?, `checked` = ? WHERE `id` = ? AND `receiver_guid` = ?");
+            statement.addUInt32(mail->itemTextId);
+            statement.addUInt32(mail->HasItems() ? 1 : 0);
+            statement.addUInt64(uint64(mail->expire_time));
+            statement.addUInt64(uint64(mail->deliver_time));
+            statement.addUInt32(mail->money);
+            statement.addUInt32(mail->COD);
+            statement.addUInt32(mail->checked);
+            statement.addUInt32(mail->messageID);
+            statement.addUInt32(GetGUIDLow());
+            if (!statement.AppendToCheckedBatch(
+                    context.Batch(), SqlAffectedRowsPolicy::Any))
             {
-                stmt = CharacterDatabase.CreateStatement(deleteMailItems, "DELETE FROM `mail_items` WHERE `item_guid` = ?");
-
-                for (const auto removedItem : m->removedItems)
-                    stmt.PExecute(removedItem);
-
-                m->removedItems.clear();
+                context.Invalidate();
+                return false;
             }
-            m->state = MAIL_STATE_UNCHANGED;
+
+            for (uint32 removedItem : mail->removedItems)
+            {
+                static SqlStatementID deleteMailItems;
+                SqlStatement item = database->CreateStatement(
+                    deleteMailItems,
+                    "DELETE FROM `mail_items` WHERE `item_guid` = ? AND `mail_id` = ?");
+                item.addUInt32(removedItem);
+                item.addUInt32(mail->messageID);
+                if (!item.AppendToCheckedBatch(
+                        context.Batch(), SqlAffectedRowsPolicy::Any))
+                {
+                    context.Invalidate();
+                    return false;
+                }
+            }
+
+            MailAck ack;
+            ack.mail = mail;
+            ack.itemTextId = mail->itemTextId;
+            ack.hasItems = mail->HasItems();
+            ack.expireTime = uint64(mail->expire_time);
+            ack.deliverTime = uint64(mail->deliver_time);
+            ack.money = mail->money;
+            ack.cod = mail->COD;
+            ack.checked = mail->checked;
+            ack.removedItems = mail->removedItems;
+            acknowledgments.push_back(std::move(ack));
         }
-        else if (m->state == MAIL_STATE_DELETED)
+        else if (mail->state == MAIL_STATE_DELETED)
         {
-            if (m->HasItems())
+            if (mail->HasItems())
             {
-                SqlStatement stmt = CharacterDatabase.CreateStatement(deleteItem, "DELETE FROM `item_instance` WHERE `guid` = ?");
-                for (const auto& item : m->items)
-                    stmt.PExecute(item.itemGuid);
+                static SqlStatementID deleteItem;
+                for (MailItemInfo const& attachment : mail->items)
+                {
+                    SqlStatement item = database->CreateStatement(
+                        deleteItem,
+                        "DELETE FROM `item_instance` WHERE `guid` = ? AND `owner_guid` = ?");
+                    item.addUInt32(attachment.itemGuid);
+                    item.addUInt32(GetGUIDLow());
+                    if (!item.AppendToCheckedBatch(
+                            context.Batch(), SqlAffectedRowsPolicy::Any))
+                    {
+                        context.Invalidate();
+                        return false;
+                    }
+                }
             }
 
-            if (m->itemTextId && m->stationery != MAIL_STATIONERY_DEFAULT)
+            if (mail->itemTextId && mail->stationery != MAIL_STATIONERY_DEFAULT)
             {
-                SqlStatement stmt = CharacterDatabase.CreateStatement(deleteItemText, "DELETE FROM `item_text` WHERE `id` = ?");
-                stmt.PExecute(m->itemTextId);
+                static SqlStatementID deleteItemText;
+                SqlStatement text = database->CreateStatement(
+                    deleteItemText, "DELETE FROM `item_text` WHERE `id` = ?");
+                text.addUInt32(mail->itemTextId);
+                if (!text.AppendToCheckedBatch(
+                        context.Batch(), SqlAffectedRowsPolicy::Any))
+                {
+                    context.Invalidate();
+                    return false;
+                }
             }
 
-            SqlStatement stmt = CharacterDatabase.CreateStatement(deleteMain, "DELETE FROM `mail` WHERE `id` = ?");
-            stmt.PExecute(m->messageID);
+            static SqlStatementID deleteMain;
+            SqlStatement main = database->CreateStatement(
+                deleteMain,
+                "DELETE FROM `mail` WHERE `id` = ? AND `receiver_guid` = ?");
+            main.addUInt32(mail->messageID);
+            main.addUInt32(GetGUIDLow());
+            if (!main.AppendToCheckedBatch(
+                    context.Batch(), SqlAffectedRowsPolicy::Any))
+            {
+                context.Invalidate();
+                return false;
+            }
 
-            stmt = CharacterDatabase.CreateStatement(deleteItems, "DELETE FROM `mail_items` WHERE `mail_id` = ?");
-            stmt.PExecute(m->messageID);
+            static SqlStatementID deleteItems;
+            SqlStatement items = database->CreateStatement(
+                deleteItems,
+                "DELETE FROM `mail_items` WHERE `mail_id` = ? AND `receiver_guid` = ?");
+            items.addUInt32(mail->messageID);
+            items.addUInt32(GetGUIDLow());
+            if (!items.AppendToCheckedBatch(
+                    context.Batch(), SqlAffectedRowsPolicy::Any))
+            {
+                context.Invalidate();
+                return false;
+            }
+
+            removedMails.push_back(mail);
         }
     }
 
-    //deallocate deleted mails...
-    for (PlayerMails::iterator itr = m_mail.begin(); itr != m_mail.end();)
-    {
-        if ((*itr)->state == MAIL_STATE_DELETED)
+    if (acknowledgments.empty() && removedMails.empty())
+        return true;
+
+    context.OnCommit([this, identity, acknowledgments, removedMails]() {
+        if (!MasterSaveIdentityMatches(*this, identity))
+            return;
+
+        for (MailAck const& ack : acknowledgments)
         {
-            Mail* m = *itr;
+            Mail* mail = ack.mail;
+            if (std::find(m_mail.begin(), m_mail.end(), mail) == m_mail.end())
+                continue;
+            if (mail->state != MAIL_STATE_CHANGED)
+                continue;
+            for (uint32 removedItem : ack.removedItems)
+            {
+                auto itr = std::find(mail->removedItems.begin(),
+                                     mail->removedItems.end(), removedItem);
+                if (itr != mail->removedItems.end())
+                    mail->removedItems.erase(itr);
+            }
+            if (mail->itemTextId == ack.itemTextId &&
+                uint32(mail->HasItems()) == uint32(ack.hasItems) &&
+                uint64(mail->expire_time) == ack.expireTime &&
+                uint64(mail->deliver_time) == ack.deliverTime &&
+                mail->money == ack.money && mail->COD == ack.cod &&
+                mail->checked == ack.checked)
+                mail->state = MAIL_STATE_UNCHANGED;
+        }
+
+        for (Mail* mail : removedMails)
+        {
+            auto itr = std::find(m_mail.begin(), m_mail.end(), mail);
+            if (itr == m_mail.end())
+                continue;
+            if (mail->state != MAIL_STATE_DELETED)
+                continue;
             m_mail.erase(itr);
-            delete m;
-            itr = m_mail.begin();
+            delete mail;
         }
-        else
-            ++itr;
-    }
 
-    m_mailsUpdated = false;
+        m_mailsUpdated = false;
+        for (Mail* mail : m_mail)
+            if (mail && mail->state != MAIL_STATE_UNCHANGED)
+            {
+                m_mailsUpdated = true;
+                break;
+            }
+    });
+    return true;
 }
 
 void MasterPlayer::RemoveMail(uint32 id)
@@ -263,7 +501,7 @@ void MasterPlayer::LoadMailedItems(std::unique_ptr<QueryResult> result)
     while (result->NextRow());
 }
 
-void MasterPlayer::LoadMails(std::unique_ptr<QueryResult> result)
+void MasterPlayer::LoadMails(std::unique_ptr<QueryResult> result, AccountLifecycleLease const* lease)
 {
     m_mail.clear();
     Player* player = GetSession()->GetPlayer();
@@ -303,7 +541,7 @@ void MasterPlayer::LoadMails(std::unique_ptr<QueryResult> result)
         m_mail.push_back(m);
 
         if (m->mailTemplateId && !m->has_items)
-            m->prepareTemplateItems(player);
+            m->prepareTemplateItems(player, lease);
 
     }
     while (result->NextRow());

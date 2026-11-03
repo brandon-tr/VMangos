@@ -67,6 +67,9 @@ class Corpse : public WorldObject
 
         void DeleteBonesFromWorld();
         void DeleteFromDB();
+        /// The corpse row was already deleted inside a composed checked unit
+        /// (character deletion); DeleteFromDB must not submit a second write.
+        void MarkDeletedFromDB() { m_dbRowDeleted = true; }
 
         ObjectGuid const& GetOwnerGuid() const { return GetGuidValue(CORPSE_FIELD_OWNER); }
 
@@ -102,6 +105,7 @@ class Corpse : public WorldObject
         CorpseType m_type;
         time_t m_time;
         GridPair m_grid;                                    // gride for corpse position for fast search
+        bool m_dbRowDeleted = false;
 };
 
 inline Corpse* Object::ToCorpse()

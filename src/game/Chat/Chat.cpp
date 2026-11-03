@@ -28,6 +28,7 @@
 #include "Log.h"
 #include "World.h"
 #include "ObjectMgr.h"
+#include "PlayerName.h"
 #include "ObjectGuid.h"
 #include "Player.h"
 #include "Group.h"
@@ -3409,7 +3410,7 @@ ObjectGuid ChatHandler::ExtractGuidFromLink(char** text)
         case GUID_LINK_PLAYER:
         {
             std::string name = idS;
-            if (!normalizePlayerName(name))
+            if (!normalizeFullPlayerNameForLookup(name))
                 return ObjectGuid();
 
             if (Player* player = sObjectMgr.GetPlayer(name.c_str()))
@@ -3496,7 +3497,7 @@ bool ChatHandler::ExtractLocationFromLink(char** text, uint32& mapid, float& x, 
         case LOCATION_LINK_PLAYER:
         {
             std::string name = idS;
-            if (!normalizePlayerName(name))
+            if (!normalizeFullPlayerNameForLookup(name))
                 return false;
 
             if (Player* player = sObjectMgr.GetPlayer(name.c_str()))
@@ -3695,7 +3696,7 @@ std::string ChatHandler::ExtractPlayerNameFromLink(char** text)
         return "";
 
     std::string name = name_str;
-    if (!normalizePlayerName(name))
+    if (!normalizeFullPlayerNameForLookup(name))
         return "";
 
     return name;

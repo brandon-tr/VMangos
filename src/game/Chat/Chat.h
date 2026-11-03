@@ -37,6 +37,7 @@ class SpellEntry;
 class QueryResult;
 class ChatHandler;
 class WorldSession;
+class AccountLifecycleLease;
 class WorldPacket;
 class MailDraft;
 class Object;
@@ -1130,16 +1131,20 @@ class ChatHandler
         {
             uint32      lowguid;                            // the low GUID from the character
             std::string name;                               // the character name
+            std::string originalName;                       // deleted_name at lookup time
             uint32      accountId;                          // the account id
+            uint32      originalAccountId;                  // deleted_account at lookup time
+            uint64      originalGeneration = 0;             // identity_generation at lookup time
+            uint64      originalDeletedTime = 0;            // raw deleted_time at lookup time
             std::string accountName;                        // the account name
-            time_t      deleteDate;                         // the date at which the character has been deleted
+            time_t      deleteDate;                         // display-only date
         };
 
         typedef std::list<DeletedInfo> DeletedInfoList;
-        bool GetDeletedCharacterInfoList(DeletedInfoList& foundList, bool useName, std::string searchString = "");
+        bool GetDeletedCharacterInfoList(DeletedInfoList& foundList, bool useName, std::string searchString);
         std::string GenerateDeletedCharacterGUIDsWhereStr(DeletedInfoList::const_iterator& itr, DeletedInfoList::const_iterator const& itr_end);
         void HandleCharacterDeletedListHelper(DeletedInfoList const& foundList);
-        void HandleCharacterDeletedRestoreHelper(DeletedInfo const& delInfo);
+        bool HandleCharacterDeletedRestoreHelper(DeletedInfo const& delInfo, AccountLifecycleLease const* lease = nullptr);
 
         void SetSentErrorMessage(bool val){ m_sentErrorMessage = val;};
     private:
